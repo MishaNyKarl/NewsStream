@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 import aiohttp
 from pydantic import ValidationError
 
-from app.ai.prompts import ANALYZE, EXTRACT
-from app.domain import Analysis, Candidate, ProviderUnavailable, StoryExtraction
+from app.ai.prompts import ANALYZE, EXTRACT, VERIFY
+from app.domain import Analysis, Candidate, ProviderUnavailable, ReviewedAnalysis, StoryExtraction
 from app.progress import report
 
 AI_ERROR = 'Сервис анализа временно недоступен. Попробуйте позже; наблюдения сохранены.'
@@ -15,6 +15,24 @@ AI_ERROR = 'Сервис анализа временно недоступен. �
 
 class _Retryable(Exception):
     pass
+
+
+def evidence_passages(sources):
+    """Give the model immutable excerpt IDs instead of asking it to retype quotes."""
+    prepared, index = [], {}
+    for number, source in enumerate(sources):
+        text = ' '.join(source['content'].split())
+        passages = []
+        while text:
+            end = len(text) if len(text) <= 800 else max(text.rfind('. ', 200, 800) + 1, text.rfind(' ', 200, 800))
+            if end < 200 and len(text) > 800:
+                end = 800
+            excerpt, text = text[:end].strip(), text[end:].strip()
+            identifier = f's{number}p{len(passages)}'
+            passages.append({'id': identifier, 'text': excerpt})
+            index[identifier] = {'url': source['url'], 'text': excerpt}
+        prepared.append({key: value for key, value in source.items() if key != 'content'} | {'passages': passages})
+    return prepared, index
 
 
 def _number(value) -> float:
@@ -134,16 +152,29 @@ class AIClient:
         for attempt in range(2):
             try:
                 raw = await self._request(messages, schema, purpose, attempt)
+                lines = raw.strip().splitlines()
+                if len(lines) >= 3 and lines[0].lower() in {'```json', '```'} and lines[-1] == '```':
+                    # Some compatible providers wrap otherwise valid JSON even
+                    # in schema mode. Unwrap only one complete outer fence;
+                    # never extract JSON from surrounding prose or skip validation.
+                    raw = '\n'.join(lines[1:-1])
                 result = schema.model_validate_json(raw, strict=True)
                 if validate:
                     validate(result)
                 return result
-            except (_Retryable, ValidationError, ValueError):
+            except (_Retryable, ValidationError, ValueError) as exc:
                 if attempt == 0:
+                    # Feedback names the failed schema/rule, never input values
+                    # or HTTP payloads. This lets the retry fix the actual error.
+                    failure = ('; '.join('.'.join(map(str, e['loc'])) + ': ' + e['type']
+                               for e in exc.errors(include_input=False)[:4])
+                               if isinstance(exc, ValidationError) else
+                               str(exc)[:250] if isinstance(exc, ValueError) else 'request_failed')
                     messages.append({'role': 'user', 'content':
                         'Повтори ответ строго по JSON Schema. Все поля обязательны; без markdown. '
                         'Проверь типы, лимиты и что доказательные URL точно взяты из sources. '
-                        'При недостатке доказательств meaningful_update=false.'})
+                        'При недостатке доказательств meaningful_update=false. '
+                        'Ошибка локальной проверки: ' + failure})
                     await asyncio.sleep(0.5)
         raise ProviderUnavailable(AI_ERROR)
 
@@ -177,6 +208,7 @@ class AIClient:
             'url': s.url, 'publisher_domain': s.domain, 'title': s.title[:400],
             'content': s.content_excerpt[:4500],
             'published_at': s.published_at.isoformat() if s.published_at else None,
+            'full_text_verified': s.full_text,
         } for s in selected]
 
         def validate(result):
@@ -188,9 +220,45 @@ class AIClient:
             if any(not fact.strip() or len(fact) > 500 for fact in result.new_facts):
                 raise ValueError('Invalid fact')
 
-        return await self._complete(ANALYZE, {'story': story_data, 'sources': source_data,
+        result = await self._complete(ANALYZE, {'story': story_data, 'sources': source_data,
             'current_time_utc': datetime.now(timezone.utc).isoformat()},
             Analysis, 'analyze', validate)
+        if not (result.meaningful_update and result.relevant and result.novelty_score >= .65
+                and result.importance_score >= .55 and result.confidence >= .75):
+            return result
+        bodies = {s['url']: s for s in source_data if s['full_text_verified']}
+        if not bodies:
+            result.meaningful_update = False
+            result.confidence = min(result.confidence, .70)
+            return result
+        review_sources, passages = evidence_passages(list(bodies.values()))
+
+        def validate_review(review):
+            if not review.meaningful_update:
+                validate(review)
+                return
+            covered = set()
+            quoted_urls = []
+            for proof in review.evidence:
+                passage = passages.get(proof.passage_id)
+                if passage is None or proof.fact_index >= len(review.new_facts):
+                    raise ValueError('Evidence must reference a full-text source and a retained fact')
+                covered.add(proof.fact_index)
+                quoted_urls.append(passage['url'])
+            if covered != set(range(len(review.new_facts))):
+                raise ValueError('Every fact requires matching evidence')
+            # Citations are deterministic consequences of validated references.
+            # Never trust or retry a redundant URL list generated by the model.
+            review.source_urls = list(dict.fromkeys(quoted_urls))
+            validate(review)
+
+        await report('verifying', sources=len(bodies))
+        # The editor checks support and attribution, not a second, narrower
+        # relevance decision based on possibly over-specific original goals.
+        review_story = {key: value for key, value in story_data.items() if key != 'watch_goals'}
+        reviewed = await self._complete(VERIFY, {'story': review_story, 'sources': review_sources,
+            'proposal': result.model_dump()}, ReviewedAnalysis, 'verify', validate_review)
+        return Analysis.model_validate(reviewed.model_dump(exclude={'evidence'}))
 
     async def close(self):
         if self._session is not None:

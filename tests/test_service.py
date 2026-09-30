@@ -31,7 +31,8 @@ def setup_service():
     ai = AsyncMock()
     search = AsyncMock()
     fetcher = AsyncMock()
-    settings=Settings(_env_file=None,llm_provider='openrouter',llm_model='model',llm_api_key='test-key',invite_code='invite-secret')
+    settings=Settings(_env_file=None,llm_provider='openrouter',llm_model='model',llm_api_key='test-key',invite_code='invite-secret',
+                      search_provider='bing_news', search_expand_queries=False, max_search_queries_per_story=3)
     return BotService(settings,repo,ai,search,fetcher)
 
 async def test_unauthorized_cannot_create_or_manually_check():
@@ -63,7 +64,7 @@ async def test_old_and_known_links_are_never_reanalyzed():
     service.repo.known_url_set.return_value={'https://example.org/known'}
     service.search.search.return_value=[
         SearchResult('https://example.org/known','Known article'),
-        SearchResult('https://example.org/old','Archive',published_at=item.created_at-timedelta(days=2)),
+        SearchResult('https://example.org/old','Archive',published_at=item.created_at-timedelta(days=10)),
     ]
     await service.check_story(item)
     service.ai.analyze.assert_not_called()

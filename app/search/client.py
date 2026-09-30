@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from defusedxml import ElementTree
 from defusedxml.common import DefusedXmlException
 
-from app.domain import ProviderUnavailable, SearchResult
+from app.domain import ProviderUnavailable, SearchResult, SearchResults
 from app.content.fetcher import validate_url
 from app.domain import UserError
 from app.search.dedupe import normalize_url
@@ -45,13 +45,21 @@ def parse_google_rss(body: bytes, query: str, limit: int) -> list[SearchResult]:
             continue
         description = plain_html(item.findtext('description') or '')[:1600]
         source = item.findtext('source') or ''
+        source_node = item.find('source')
+        publisher_domain = ''
+        if source_node is not None:
+            try:
+                publisher_domain = urlsplit(validate_url(source_node.get('url') or '')).hostname or ''
+            except UserError:
+                pass
         # RSS supplies a headline, not a verified article body. Preserve that
         # limitation all the way into the LLM context.
         snippet = f'[Только заголовок/краткий фрагмент RSS; полный текст не проверен.] {description}'
         if source:
             snippet += f' Источник: {source[:150]}.'
         results.append(SearchResult(url=url, title=title, snippet=snippet,
-                                    published_at=parse_date(item.findtext('pubDate')), query=query))
+                                    published_at=parse_date(item.findtext('pubDate')), query=query,
+                                    publisher_domain=publisher_domain))
         if len(results) >= limit:
             break
     return results
@@ -117,11 +125,33 @@ class SearchClient:
             return bytes(data)
 
     async def search(self, query: str) -> list[SearchResult]:
+        if self.settings.search_provider != 'hybrid_news':
+            provider = self.settings.search_provider
+            return SearchResults(await self._search(query, provider), providers=(provider,))
+        providers = ('bing_news', 'google_news')
+        batches = await asyncio.gather(*(self._search(query, provider) for provider in providers), return_exceptions=True)
+        failed = [provider for provider, rows in zip(providers, batches) if isinstance(rows, Exception)]
+        if len(failed) == len(providers):
+            raise ProviderUnavailable(SEARCH_ERROR)
+        results = []
+        seen = set()
+        # Interleave providers, so one provider cannot consume all early slots.
+        valid = [rows for rows in batches if not isinstance(rows, Exception)]
+        for index in range(max((len(rows) for rows in valid), default=0)):
+            for rows in valid:
+                if index < len(rows):
+                    result = rows[index]
+                    key = normalize_url(result.url)
+                    if key not in seen:
+                        results.append(result)
+                        seen.add(key)
+        return SearchResults(results, providers=providers, failed_providers=failed)
+
+    async def _search(self, query: str, provider: str) -> list[SearchResult]:
         import json
         query = ' '.join(query.split())[:350]
         if not query:
             return []
-        provider = self.settings.search_provider
         limit = max(1, min(10, self.settings.max_results_per_query))
         if provider not in ('google_news', 'bing_news', 'brave', 'tavily'):
             raise ProviderUnavailable('Администратору нужно настроить поискового провайдера.')
@@ -136,9 +166,12 @@ class SearchClient:
                     params={'q': query, 'format': 'rss', 'mkt': locale, 'count': limit, 'sortbydate': '1'})
                 results = parse_bing_rss(body, query, limit)
             elif provider == 'google_news':
-                effective = query if 'when:' in query else f'{query} when:7d'
+                days = max(1, min(14, getattr(self.settings, 'search_recent_days', 7)))
+                effective = query if 'when:' in query else f'{query} when:{days}d'
+                locale = {'hl': 'ru', 'gl': 'RU', 'ceid': 'RU:ru'} if re.search('[А-Яа-яЁё]', query) else {
+                    'hl': 'en-US', 'gl': 'US', 'ceid': 'US:en'}
                 body = await self._read('GET', 'https://news.google.com/rss/search',
-                    params={'q': effective, 'hl': 'en-US', 'gl': 'US', 'ceid': 'US:en'})
+                    params={'q': effective, **locale})
                 results = parse_google_rss(body, query, limit)
             elif provider == 'brave':
                 body = await self._read('GET', 'https://api.search.brave.com/res/v1/news/search',

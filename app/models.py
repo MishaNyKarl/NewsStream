@@ -126,7 +126,8 @@ class UserInterest(Base):
 
 class StoryUpdate(Base):
     __tablename__ = "story_updates"
-    __table_args__ = (Index("ix_updates_outbox", "notified_at", "delivery_locked_until"),)
+    __table_args__ = (Index("ix_updates_outbox", "notified_at", "delivery_locked_until"),
+                     CheckConstraint("update_kind IN ('development','context')", name="ck_update_kind"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
     summary: Mapped[str] = mapped_column(Text)
@@ -138,6 +139,7 @@ class StoryUpdate(Base):
     source_urls: Mapped[list] = mapped_column(JSON, default=list)
     reason: Mapped[str] = mapped_column(Text, default="")
     is_demo: Mapped[bool] = mapped_column(Boolean, default=False)
+    update_kind: Mapped[str] = mapped_column(String(16), default="development", server_default="development")
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     notified_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     delivery_attempts: Mapped[int] = mapped_column(Integer, default=0)

@@ -191,6 +191,12 @@ def extract_content(url: str, body: bytes, content_type: str, charset: str | Non
         main = soup.find('article') or soup.find('main') or soup.body or soup
         text = main.get_text(' ', strip=True)
     text = ' '.join(text.split())[:18_000]
+    lowered = text.lower()
+    if (title.lower().strip() in {'access denied', 'just a moment...', 'just a moment', 'attention required! | cloudflare'}
+            or (len(text) < 2000 and any(marker in lowered for marker in (
+                'enable javascript and cookies to continue', 'verify you are human',
+                'checking your browser before accessing', 'please enable javascript to view this page')))):
+        raise UserError(FETCH_ERROR)
     if len(text) < 100:
         raise UserError(FETCH_ERROR)
     return FetchedContent(url=url, title=title, text=text)

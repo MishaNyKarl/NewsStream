@@ -20,7 +20,7 @@ MSK = timezone(timedelta(hours=3))
 
 def stage_index(operation, event):
     if operation == "check":
-        return {"searching": 0, "reading_sources": 1, "analyzing": 2,
+        return {"searching": 0, "reading_sources": 1, "analyzing": 2, "verifying": 2,
                 "model_wait": 2, "saving_result": 3}.get(event.stage)
     return {"starting": 0, "reading_input": 0, "extracting": 1,
             "model_wait": 1, "saving_draft": 2}.get(event.stage)
@@ -37,7 +37,7 @@ def stage_bar(operation, event, visited=None, status=None):
     seen = set(visited or ())
     if current is not None:
         seen.add(current)
-    successful = status in {"completed", "changed", "unchanged", "no_sources"}
+    successful = status in {"completed", "changed", "unchanged", "no_sources", "unverified"}
     segments = []
     for index in range(count):
         if status and not successful and index == current:
@@ -91,12 +91,13 @@ def progress_text(operation, story_id, event, elapsed, stage_elapsed, *, started
         "extracting": "🧠 Разбираю событие и определяю, за чем следить…",
         "saving_draft": "💾 Сохраняю карточку наблюдения…",
         "searching": f"🔎 Ищу публикации — запрос {data.get('current', 1)} из {data.get('total', 1)}…",
-        "reading_sources": f"📄 Читаю источники — открываю материал №{data.get('current', 1)}…",
+        "reading_sources": f"📄 Изучаю источники — материал №{data.get('current', 1)}…",
         "analyzing": f"🧠 Сравниваю новые материалы с известными фактами: {data.get('sources', 0)}…",
+        "verifying": "🔎 Проверяю формулировки и подтверждения в источниках…",
         "saving_result": "💾 Сохраняю результат проверки…",
     }
     if event.stage == "model_wait":
-        action = "Разбираю новость" if data.get("purpose") == "extract" else "Сравниваю факты"
+        action = {"extract": "Разбираю новость", "verify": "Проверяю подтверждения"}.get(data.get("purpose"), "Сравниваю факты")
         stage = f"🧠 {action} — жду ответ модели…"
         if data.get("attempt", 1) > 1:
             stage += "\nПервая попытка не дала корректного результата. Выполняю повторный запрос."
@@ -115,17 +116,32 @@ def progress_text(operation, story_id, event, elapsed, stage_elapsed, *, started
 
 def outcome_text(outcome, elapsed=None):
     if outcome.status == "changed":
-        body = "✅ Проверка завершена. Найдено существенное развитие.\nПодробности — в отдельном уведомлении и истории темы."
+        finding = "Найдено уточнение исходной новости." if outcome.update_kind == "context" else "Найдено существенное развитие."
+        body = f"✅ Проверка завершена. {finding}\nПодробности — в отдельном уведомлении и истории темы."
     elif outcome.status == "unchanged":
         body = "✅ Проверка завершена. Существенного развития не найдено в проверенных материалах."
     elif outcome.status == "no_sources":
         body = "✅ Проверка завершена. Подходящих новых публикаций не найдено в проверенных источниках."
+    elif outcome.status == "unverified":
+        body = "⚠️ Материалы найдены, но надёжно подтвердить развитие пока не удалось. Это не означает, что развития нет."
+        if outcome.search_summary.get('full_texts', 0) == 0:
+            body += "\nНайдены только заголовки и фрагменты; полные тексты недоступны."
     elif outcome.status == "cancelled":
         body = "⏹ " + html.escape(outcome.message[:1800])
     else:
         body = "⚠️ " + html.escape(outcome.message[:1800]) + "\nЭта проверка не завершена; отсутствие новых фактов не подтверждено."
     if outcome.status in {"changed", "unchanged"}:
-        body += f"\nНовых материалов проверено: {outcome.sources}."
+        body += f"\nМатериалов для анализа: {outcome.sources}."
+    summary = outcome.search_summary
+    if summary:
+        labels = {'bing_news': 'Bing News', 'google_news': 'Google News', 'hybrid_news': 'Bing News + Google News'}
+        providers = ', '.join(labels.get(value, value) for value in summary.get('providers', []))
+        if providers:
+            body += f"\n\n🔎 {html.escape(providers)} · запросов: {summary.get('queries', 0)}"
+        body += f"\nРезультатов выдачи: {summary.get('results', 0)}."
+        body += f"\nПолных текстов: {summary.get('full_texts', 0)} · фрагментов: {summary.get('snippets', 0)}."
+        if outcome.status == "no_sources":
+            body += f"\nПовторы: {summary.get('duplicates', 0)} · вне периода поиска: {summary.get('outside_window', 0)}."
     if outcome.partial_search:
         body += "\nЧасть поисковых запросов была недоступна — результат неполный."
     return body + (f"\n\nВремя: {elapsed_text(elapsed)}" if elapsed is not None else "")

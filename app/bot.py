@@ -119,11 +119,16 @@ def _keyboard(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
 
 def notification_text(story: Any, update: Any) -> str:
     demo = bool(getattr(update, "is_demo", False))
-    heading = "🧪 Демонстрационное обновление" if demo else "🔔 Есть развитие"
+    context_only = getattr(update, "update_kind", "development") == "context"
+    heading = "🧪 Демонстрационное обновление" if demo else (
+        "📌 Уточнение исходной новости" if context_only else "🔔 Есть развитие")
     parts = [heading, f"<b>{escaped(story.title, 180)}</b>"]
     if demo:
         parts.append("Это тест уведомления, не реальная новость. Состояние наблюдения не изменено.")
-    parts.append("<b>Что нового</b>\n" + escaped(update.summary, 650))
+    elif context_only:
+        parts.append("Нашёл важные сведения, которых не было в исходной карточке. Их появление после подписки не подтверждено.")
+    label = "Что уточнилось" if context_only and not demo else "Что нового"
+    parts.append(f"<b>{label}</b>\n" + escaped(update.summary, 650))
     facts = _bullets(getattr(update, "new_facts", []), 3, 170)
     if facts:
         parts.append(facts)

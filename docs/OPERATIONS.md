@@ -43,6 +43,12 @@ docker compose logs --tail 100 bot worker
 
 ## Изменение модели или провайдера
 
+Для поиска `SEARCH_PROVIDER=hybrid_news` включает Bing News RSS и Google News RSS. `MAX_SEARCH_QUERIES_PER_STORY=6`, `MAX_RESULTS_PER_QUERY=8`, `MAX_SOURCE_READS_PER_CHECK=10`, `MAX_SOURCES_PER_CHECK=6` ограничивают нагрузку. `SEARCH_LOOKBACK_HOURS=48` даёт окно уточнения исходных сведений; `SEARCH_RECENT_DAYS=7` ограничивает архив для давних тем. `MAX_SOURCE_RECHECKS=2` и `SOURCE_RECHECK_MINUTES=15` регулируют повторное чтение статей. После изменения примените окружение к обоим процессам.
+
+В `usage_events` запись `search_summary` содержит фактические счётчики: queries, failed, results, duplicates, outside_window, before_subscription, full_texts, snippets, providers. results включает совпадения между формулировками; full_texts/snippets относятся к выбранным материалам анализа. Ноль новых материалов не доказывает отсутствие событий. Для разбора пропуска сопоставляйте запросы, даты публикаций, полученные тексты и историю темы.
+
+Миграция `0004_search_context` добавляет вид обновления `development/context`; существующим уведомлениям назначается development. При откате кода дополнительную колонку можно оставить. Резервные копии обновления поиска: `backups/search-20260930`, прежний образ `newswatch:before-search`; защищённый `env-before` нужен для возврата прежних параметров поиска. Остальные ключи и лимиты изменять не требуется.
+
 Отредактируйте `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL` и при необходимости `LLM_BASE_URL`. После смены модели убедитесь, что поддерживается JSON schema. Обновите стоимость токенов. Примените окружение:
 
 ```sh

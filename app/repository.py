@@ -400,27 +400,43 @@ class Repository:
             if (story is None or story.status != "active" or not lock_token or story.lock_token != lock_token
                 or story.lock_until is None or story.lock_until <= now):
                 return None
-            seen = set((await session.scalars(select(Source.normalized_url).where(Source.story_id == story_id))).all())
-            hashes = set((await session.scalars(select(Source.content_hash).where(Source.story_id == story_id))).all())
+            existing = list((await session.scalars(select(Source).where(Source.story_id == story_id))).all())
+            by_url = {source.normalized_url: source for source in existing}
+            hashes = {source.content_hash for source in existing}
             added = False
             for candidate in candidates:
-                if candidate.normalized_url in seen:
+                previous = by_url.get(candidate.normalized_url)
+                if previous is not None:
+                    if previous.content_hash != candidate.content_hash and candidate.full_text:
+                        # Update the observed version, retaining URL uniqueness.
+                        added = added or candidate.content_hash not in hashes
+                        previous.content_hash = candidate.content_hash
+                        previous.content_excerpt = candidate.content_excerpt
+                        previous.title = candidate.title
+                        previous.fetched_at = now
+                        previous.relevance_score = analysis.confidence if analysis and analysis.relevant else 0
+                        hashes.add(candidate.content_hash)
                     continue
                 duplicate = candidate.content_hash in hashes
-                session.add(Source(story_id=story_id, url=candidate.url, normalized_url=candidate.normalized_url,
+                source = Source(story_id=story_id, url=candidate.url, normalized_url=candidate.normalized_url,
                     domain=candidate.domain, title=candidate.title, published_at=candidate.published_at,
                     content_hash=candidate.content_hash, content_excerpt=candidate.content_excerpt,
                     search_query=candidate.search_query, relevance_score=analysis.confidence if analysis and analysis.relevant else 0,
-                    is_duplicate=duplicate))
-                seen.add(candidate.normalized_url)
+                    is_duplicate=duplicate)
+                session.add(source)
+                by_url[candidate.normalized_url] = source
                 hashes.add(candidate.content_hash)
                 added = added or not duplicate
             if not added or analysis is None or not analysis.meaningful_update or not analysis.relevant:
                 return None
+            evidence = [candidate for candidate in candidates if candidate.url in analysis.source_urls]
+            context_only = bool(evidence) and all(candidate.published_at is None or
+                candidate.published_at < story.created_at for candidate in evidence)
             result = StoryUpdate(story_id=story_id, summary=analysis.notification_summary,
                 new_facts=analysis.new_facts, previous_state=story.current_state, new_state=analysis.updated_state,
                 importance_score=analysis.importance_score, confidence_score=analysis.confidence,
-                source_urls=analysis.source_urls, reason=analysis.reason, is_demo=False)
+                source_urls=analysis.source_urls, reason=analysis.reason, is_demo=False,
+                update_kind="context" if context_only else "development")
             session.add(result)
             story.current_state = analysis.updated_state
             story.last_meaningful_update_at = now

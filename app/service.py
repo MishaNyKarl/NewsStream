@@ -1,11 +1,12 @@
 """Application boundary: ownership, usage budgets and the monitoring workflow."""
 import asyncio
 import hmac
+import json
 import logging
 import re
 import time
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 from app.ai.client import AIClient
@@ -15,6 +16,7 @@ from app.domain import Candidate, ProviderUnavailable, UserError
 from app.repository import Repository
 from app.search.client import SearchClient
 from app.search.dedupe import content_hash, is_near_duplicate, normalize_url
+from app.search.planning import diverse_results, plan_queries, publisher, source_cutoff
 from app.progress import CheckMetrics, CheckOutcome, progress_context, report
 
 log = logging.getLogger(__name__)
@@ -196,48 +198,79 @@ class BotService:
                     await self._error('check_status', exc, story_id=story.id, user_id=story.user_id)
 
     async def _candidates(self, story, metrics=None):
+        metrics = metrics if metrics is not None else CheckMetrics()
         known = await self.repo.known_sources(story.id)
         known_urls = await self.repo.known_url_set(story.id)
-        if story.original_url:
-            known_urls.add(normalize_url(story.original_url))
+        known_by_url = {source.normalized_url: source for source in known}
         hashes = {source.content_hash for source in known}
         excerpts = [source.content_excerpt for source in known if source.content_excerpt]
         results = []
         successful_queries = 0
-        queries = story.search_queries[:self.settings.max_search_queries_per_story]
+        queries = plan_queries(story, self.settings)
         for number, query in enumerate(queries, 1):
             await report('searching', current=number, total=len(queries), results=len(results))
             try:
-                results.extend(await self.search.search(query))
+                batch = await self.search.search(query)
+                results.extend(batch)
+                providers = getattr(batch, 'providers', (self.settings.search_provider,))
+                metrics.queries += len(providers)
+                metrics.providers.update(providers)
+                metrics.queries_failed += len(getattr(batch, 'failed_providers', ()))
                 successful_queries += 1
             except Exception as exc:
-                if metrics is not None:
-                    metrics.queries_failed += 1
+                attempted = 2 if self.settings.search_provider == 'hybrid_news' else 1
+                metrics.queries_failed += attempted
+                metrics.queries += attempted
                 await self._error('search', exc, story_id=story.id, user_id=story.user_id)
         if not successful_queries:
             raise ProviderUnavailable('Поиск временно недоступен.')
-        candidates = []
-        attempted = 0
+        metrics.results = len(results)
+        now = datetime.now(timezone.utc)
+        cutoff = source_cutoff(story, self.settings, now)
+        unique = {}
         for result in results:
-            if len(candidates) >= max(1, min(6, self.settings.max_sources_per_check)):
-                break
             try:
                 normalized = normalize_url(result.url)
             except (ValueError, TypeError):
                 continue
             if len(normalized.encode('utf-8')) > 2000:
                 continue
+            if result.published_at and not cutoff <= utc(result.published_at) <= now + timedelta(minutes=30):
+                metrics.outside_window += 1
+                continue
+            if normalized in unique:
+                metrics.duplicates += 1
+                previous = unique[normalized]
+                if result.published_at and (not previous.published_at or result.published_at > previous.published_at):
+                    unique[normalized] = result
+            else:
+                unique[normalized] = result
+        pool = []
+        rechecks = 0
+        reads = 0
+        seen_titles = set()
+        for result in diverse_results(list(unique.values()), utc(story.created_at)):
+            if reads >= max(1, min(12, self.settings.max_source_reads_per_check)):
+                break
+            normalized = normalize_url(result.url)
+            previous = known_by_url.get(normalized)
             if normalized in known_urls:
-                await self.repo.record_usage('source_duplicate', story_id=story.id, user_id=story.user_id)
+                eligible = (previous is not None and previous.fetched_at <= now - timedelta(
+                    minutes=max(5, self.settings.source_recheck_minutes)))
+                if not eligible or rechecks >= max(0, min(3, self.settings.max_source_rechecks)):
+                    metrics.duplicates += 1
+                    continue
+                rechecks += 1
+            title_key = (publisher(result), content_hash(result.title.rsplit(' - ', 1)[0]))
+            if title_key in seen_titles:
+                metrics.duplicates += 1
                 continue
-            known_urls.add(normalized)
-            # Monitoring starts at creation, so archive headlines are not sold as fresh news.
-            if result.published_at and utc(result.published_at) < utc(story.created_at):
-                continue
+            seen_titles.add(title_key)
             body = result.snippet
             title = result.title
-            attempted += 1
-            await report('reading_sources', current=attempted, results=len(results))
+            reads += 1
+            full_text = False
+            await report('reading_sources', current=reads, results=len(results))
             try:
                 page = await self.fetcher.fetch(result.url)
                 # Google News RSS links often lead to a JS-only shell. In that case
@@ -245,19 +278,37 @@ class BotService:
                 if urlsplit(page.url).hostname not in {'news.google.com', 'consent.google.com'} and len(page.text) >= 120:
                     body = page.text[:7000]
                     title = page.title or title
+                    full_text = True
             except Exception:
                 pass
             excerpt = (title + '\n' + (body or ''))[:7500]
             digest = content_hash(excerpt)
-            if digest in hashes or is_near_duplicate(excerpt, excerpts):
+            # A changed article at the same URL may contain just one important
+            # new sentence. Let the fact comparison decide, rather than fuzzy
+            # deduplication erasing it. Never replace a full article with a
+            # transient RSS fragment during a revisit.
+            if (previous is not None and not full_text) or digest in hashes or (
+                    previous is None and is_near_duplicate(excerpt, excerpts)):
+                metrics.duplicates += 1
                 await self.repo.record_usage('source_duplicate', story_id=story.id, user_id=story.user_id)
                 continue
             hashes.add(digest)
             excerpts.append(excerpt)
-            candidates.append(Candidate(url=result.url, normalized_url=normalized,
-                domain=urlsplit(result.url).hostname or '', title=title[:300],
+            pool.append(Candidate(url=result.url, normalized_url=normalized,
+                domain=publisher(result), title=title[:300],
                 content_excerpt=excerpt, content_hash=digest, search_query=result.query,
-                published_at=result.published_at))
+                published_at=result.published_at, full_text=full_text))
+        # Preserve publisher ordering within each group, and prefer actual
+        # article bodies over headlines when the analysis budget is full.
+        pool.sort(key=lambda candidate: not candidate.full_text)
+        candidates = pool[:max(1, min(6, self.settings.max_sources_per_check))]
+        metrics.full_texts = sum(candidate.full_text for candidate in candidates)
+        metrics.snippets = len(candidates) - metrics.full_texts
+        metrics.before_subscription = sum(candidate.published_at is not None and
+            utc(candidate.published_at) < utc(story.created_at) for candidate in candidates)
+        await self.repo.record_usage('search_summary', story_id=story.id, user_id=story.user_id,
+                                     detail=json.dumps(metrics.summary(), ensure_ascii=False))
+        for _ in candidates:
             await self.repo.record_usage('source_new', story_id=story.id, user_id=story.user_id)
         return candidates
 
@@ -285,14 +336,25 @@ class BotService:
                         analysis = await self.ai.analyze(context, candidates)
                         allowed = {candidate.url for candidate in candidates}
                         analysis.source_urls = [url for url in analysis.source_urls if url in allowed]
+                        evidence = [candidate for candidate in candidates if candidate.url in analysis.source_urls]
+                        if evidence and not any(candidate.full_text for candidate in evidence):
+                            analysis.confidence = min(analysis.confidence, .70)
                         analysis.meaningful_update = bool(analysis.meaningful_update and analysis.relevant
                             and analysis.novelty_score >= .65 and analysis.importance_score >= .55
                             and analysis.confidence >= .75 and analysis.new_facts and analysis.source_urls
                             and analysis.notification_summary and analysis.updated_state)
                     await report('saving_result', sources=len(candidates))
-                    update = await self.repo.save_check(story.id, story.lock_token, candidates, analysis)
-                    outcome = CheckOutcome('changed' if update else ('unchanged' if candidates else 'no_sources'),
-                                           sources=len(candidates), partial_search=bool(metrics.queries_failed))
+                    uncertain = bool(candidates and (not any(c.full_text for c in candidates)
+                        or (analysis and analysis.relevant and analysis.confidence < .75)))
+                    # An inconclusive attempt must not permanently mark article
+                    # URLs as processed and prevent a future, successful retry.
+                    update = await self.repo.save_check(story.id, story.lock_token, [] if uncertain else candidates, analysis)
+                    status = ('changed' if update else 'unverified' if uncertain
+                              else 'unchanged' if candidates else 'no_sources')
+                    outcome = CheckOutcome(status,
+                                           sources=len(candidates), partial_search=bool(metrics.queries_failed),
+                                           update_kind=getattr(update, 'update_kind', 'development'),
+                                           search_summary=metrics.summary())
                     await self.repo.record_usage('check', user_id=story.user_id, story_id=story.id,
                         detail=f'sources={len(candidates)}; update={bool(update)}; seconds={time.monotonic()-started:.1f}')
         except asyncio.CancelledError:
@@ -303,7 +365,8 @@ class BotService:
             reason = str(exc) if isinstance(exc, UserError) else (
                 'Проверка заняла слишком много времени.' if isinstance(exc, TimeoutError)
                 else 'Не удалось завершить проверку из-за временного сбоя.')
-            outcome = CheckOutcome('error', sources=len(candidates), message=reason)
+            outcome = CheckOutcome('error', sources=len(candidates), message=reason,
+                                   partial_search=bool(metrics.queries_failed), search_summary=metrics.summary())
             await self._error('check', exc, story_id=story.id, user_id=story.user_id)
         finally:
             try:
@@ -359,7 +422,8 @@ class BotService:
                 value = f'{value:.4f}'
             lines.append(f'{labels.get(key, key)}: {value}')
         lines.append(f'Лимит анализа: {self.settings.llm_daily_call_limit} обращений/сутки (UTC).')
-        provider_label = {'google_news': 'Google News RSS', 'bing_news': 'Bing News RSS'}.get(self.settings.search_provider, self.settings.search_provider)
+        provider_label = {'google_news': 'Google News RSS', 'bing_news': 'Bing News RSS',
+                          'hybrid_news': 'Bing News + Google News RSS'}.get(self.settings.search_provider, self.settings.search_provider)
         lines.append(f'Поиск: {provider_label}.')
         return '\n'.join(lines)
 

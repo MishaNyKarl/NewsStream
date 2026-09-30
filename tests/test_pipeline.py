@@ -312,7 +312,8 @@ async def test_citations_must_be_exact_candidate_urls():
 @pytest.mark.asyncio
 async def test_valid_analysis_includes_known_state_and_sources():
     client = AIClient(settings())
-    client._session = Session([completion(ANALYSIS)])
+    client._session = Session([completion(ANALYSIS), completion(ANALYSIS | {'evidence': [
+        {'fact_index': 0, 'passage_id': 's0p0'}]})])
     result = await client.analyze({'current_state': 'Дата неизвестна', 'known_facts': ['Анонс уже был.']}, [candidate()])
     assert result.meaningful_update
     payload = client._session.calls[0][1]['json']

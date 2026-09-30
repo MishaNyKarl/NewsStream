@@ -35,8 +35,24 @@ class CheckOutcome:
     sources: int = 0
     partial_search: bool = False
     message: str = ""
+    update_kind: str = "development"
+    search_summary: dict = field(default_factory=dict)
 
 
 @dataclass
 class CheckMetrics:
     queries_failed: int = 0
+    queries: int = 0
+    results: int = 0
+    duplicates: int = 0
+    outside_window: int = 0
+    before_subscription: int = 0
+    full_texts: int = 0
+    snippets: int = 0
+    providers: set = field(default_factory=set)
+
+    def summary(self):
+        return {"queries": self.queries, "failed": self.queries_failed, "results": self.results,
+                "duplicates": self.duplicates, "outside_window": self.outside_window,
+                "before_subscription": self.before_subscription, "full_texts": self.full_texts,
+                "snippets": self.snippets, "providers": sorted(self.providers)}

@@ -80,6 +80,18 @@ async def test_no_new_sources_has_explicit_result_without_fake_analysis_stage():
     assert 'Подходящих новых публикаций не найдено' in outcome_text(result, 3)
 
 
+async def test_unconfirmed_analysis_keeps_articles_eligible_and_does_not_claim_no_news():
+    service = service_with_results()
+    service.ai.analyze.return_value = analysis(meaningful_update=False, confidence=0)
+    result = await service.check_story(story())
+    assert result.status == 'unverified'
+    assert service.repo.save_check.call_args.args[2] == []
+    rendered = outcome_text(result, 10)
+    assert 'Это не означает, что развития нет' in rendered
+    assert 'полные тексты недоступны' not in rendered
+    assert 'Полных текстов: 1' in rendered
+
+
 async def test_partial_search_is_disclosed_and_total_failure_is_not_no_news():
     service = service_with_results()
     item = story()
