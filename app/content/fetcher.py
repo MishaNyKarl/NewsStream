@@ -7,6 +7,7 @@ Every redirect is separately validated. Proxy environment variables are ignored.
 import asyncio
 import ipaddress
 import socket
+import zlib
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
@@ -86,6 +87,47 @@ class PublicResolver(AbstractResolver):
         pass
 
 
+async def read_bounded_body(response) -> bytes:
+    """Bound both the transferred and decoded body without unbounded flush()."""
+    encoding = response.headers.get('Content-Encoding', 'identity').strip().lower()
+    if encoding not in ('identity', 'gzip', 'deflate'):
+        raise UserError(FETCH_ERROR)
+    if response.content_length is not None and response.content_length > MAX_BYTES:
+        raise UserError(FETCH_ERROR)
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding == 'gzip' else None
+    pending = b''
+    transferred = 0
+    body = bytearray()
+    try:
+        async for chunk in response.content.iter_chunked(32_768):
+            transferred += len(chunk)
+            if transferred > MAX_BYTES:
+                raise UserError(FETCH_ERROR)
+            if encoding == 'deflate' and decoder is None:
+                pending += chunk
+                if len(pending) < 2:
+                    continue
+                # RFC deflate has a zlib header; support the raw variant used
+                # by some servers without retrying an unbounded decode.
+                wrapped = pending[0] & 15 == 8 and int.from_bytes(pending[:2], 'big') % 31 == 0
+                decoder = zlib.decompressobj(zlib.MAX_WBITS if wrapped else -zlib.MAX_WBITS)
+                chunk, pending = pending, b''
+            if decoder is not None:
+                # max_length is a hard output bound. The extra byte lets us
+                # detect overflow; flush(length) would NOT provide this bound.
+                chunk = decoder.decompress(chunk, MAX_BYTES - len(body) + 1)
+                if decoder.unconsumed_tail or decoder.unused_data:
+                    raise UserError(FETCH_ERROR)
+            body.extend(chunk)
+            if len(body) > MAX_BYTES:
+                raise UserError(FETCH_ERROR)
+        if encoding != 'identity' and (decoder is None or not decoder.eof):
+            raise UserError(FETCH_ERROR)
+    except zlib.error:
+        raise UserError(FETCH_ERROR) from None
+    return bytes(body)
+
+
 class ContentFetcher:
     def __init__(self):
         self._session = None
@@ -95,7 +137,7 @@ class ContentFetcher:
             self._session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False, limit=8),
                 timeout=aiohttp.ClientTimeout(total=15), trust_env=False, auto_decompress=False,
-                headers={'User-Agent': 'NewsWatchMVP/1.0', 'Accept-Encoding': 'identity',
+                headers={'User-Agent': 'NewsWatchMVP/1.0', 'Accept-Encoding': 'gzip, deflate, identity',
                          'Accept': 'text/html,application/xhtml+xml,text/plain'},
             )
         return self._session
@@ -118,16 +160,8 @@ class ContentFetcher:
                         content_type = response.headers.get('Content-Type', '').split(';')[0].lower()
                         if content_type not in ('text/html', 'application/xhtml+xml', 'text/plain'):
                             raise UserError(FETCH_ERROR)
-                        if response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
-                            raise UserError(FETCH_ERROR)
-                        if response.content_length is not None and response.content_length > MAX_BYTES:
-                            raise UserError(FETCH_ERROR)
-                        chunks = bytearray()
-                        async for chunk in response.content.iter_chunked(32_768):
-                            chunks.extend(chunk)
-                            if len(chunks) > MAX_BYTES:
-                                raise UserError(FETCH_ERROR)
-                        return extract_content(current, bytes(chunks), content_type, response.charset)
+                        body = await read_bounded_body(response)
+                        return extract_content(current, body, content_type, response.charset)
         except UserError:
             raise
         except (aiohttp.ClientError, TimeoutError, OSError, UnicodeError, ValueError):

@@ -1,6 +1,8 @@
 import asyncio
+import gzip
 import json
 import socket
+import zlib
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -9,7 +11,7 @@ import pytest
 from defusedxml.common import DefusedXmlException
 
 from app.ai import AIClient
-from app.content.fetcher import ContentFetcher, PublicResolver, extract_content, validate_url
+from app.content.fetcher import MAX_BYTES, ContentFetcher, PublicResolver, extract_content, read_bounded_body, validate_url
 from app.domain import Candidate, ProviderUnavailable, UserError
 from app.search import SearchClient
 from app.search.client import parse_bing_rss, parse_date, parse_google_rss
@@ -145,6 +147,60 @@ async def test_content_size_limit_and_unreadable_html():
         await fetcher.fetch('https://example.com/')
     with pytest.raises(UserError):
         extract_content('https://example.com', b'<h1>Blocked</h1>', 'text/html')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('encoding', ['gzip', 'deflate', 'raw-deflate'])
+async def test_compressed_article_fetch_extracts_actual_text(encoding):
+    article = b'<html><title>Release</title><article>' + b'The release is confirmed. ' * 20 + b'</article></html>'
+    if encoding == 'gzip':
+        compressed = gzip.compress(article)
+    elif encoding == 'deflate':
+        compressed = zlib.compress(article)
+    else:
+        compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        compressed = compressor.compress(article) + compressor.flush()
+    fetcher = ContentFetcher()
+    fetcher._session = Session([Response(compressed, headers={
+        'Content-Type': 'text/html', 'Content-Encoding': 'deflate' if encoding == 'raw-deflate' else encoding})])
+    result = await fetcher.fetch('https://example.com/release')
+    assert result.title == 'Release'
+    assert result.text == ('The release is confirmed. ' * 20).strip()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('encoding,compress', [('gzip', gzip.compress), ('deflate', zlib.compress)])
+async def test_compression_bomb_rejected_before_unbounded_output(encoding, compress):
+    compressed = compress(b'a' * (MAX_BYTES * 8))
+    assert len(compressed) < MAX_BYTES
+    response = Response(compressed, headers={'Content-Encoding': encoding})
+    with pytest.raises(UserError):
+        await read_bounded_body(response)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('encoding,compress', [('gzip', gzip.compress), ('deflate', zlib.compress)])
+async def test_truncated_compressed_body_rejected_even_when_text_is_complete(encoding, compress):
+    compressed = compress(b'Complete-looking article body. ' * 40)
+    response = Response(compressed[:-4], headers={'Content-Encoding': encoding})
+    with pytest.raises(UserError):
+        await read_bounded_body(response)
+
+
+@pytest.mark.asyncio
+async def test_encoded_transfer_limit_enforced_without_content_length():
+    response = Response(b'x' * (MAX_BYTES + 1))
+    response.content_length = None
+    with pytest.raises(UserError):
+        await read_bounded_body(response)
+
+
+@pytest.mark.asyncio
+async def test_unsupported_or_corrupt_compression_rejected():
+    for payload, encoding in [(b'anything', 'br'), (b'invalid gzip', 'gzip'),
+                              (gzip.compress(b'news') + b'trailing garbage', 'gzip')]:
+        with pytest.raises(UserError):
+            await read_bounded_body(Response(payload, headers={'Content-Encoding': encoding}))
 
 
 def test_visible_article_extraction_strips_scripts():

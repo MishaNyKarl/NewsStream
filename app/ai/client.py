@@ -33,7 +33,7 @@ class AIClient:
     def _configuration(self):
         provider = self.settings.llm_provider
         defaults = {
-            'openrouter': ('https://openrouter.ai/api/v1', 'google/gemini-2.5-flash-lite'),
+            'openrouter': ('https://openrouter.ai/api/v1', 'qwen/qwen3-30b-a3b-instruct-2507'),
             'openai': ('https://api.openai.com/v1', 'gpt-4.1-mini'),
             'gemini': ('https://generativelanguage.googleapis.com/v1beta/openai', 'gemini-2.5-flash-lite'),
             'ollama': ('http://localhost:11434/v1', 'qwen2.5:7b'),

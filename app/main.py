@@ -8,6 +8,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BotCommand, LinkPreviewOptions
 from app.bot import build_router
 from app.config import get_settings
@@ -33,13 +34,19 @@ async def main(role='bot'):
         if role == 'worker':
             await run_worker(service, bot)
         else:
-            await bot.set_my_commands([
-                BotCommand(command='start', description='Как работает бот'),
-                BotCommand(command='watching', description='Мои наблюдения'),
-                BotCommand(command='check_now', description='Проверить сюжет'),
-                BotCommand(command='help', description='Помощь'),
-                BotCommand(command='admin', description='Управление тестом'),
-            ])
+            try:
+                await bot.set_my_name(name='Развитие новостей', request_timeout=15)
+                await bot.set_my_description(description='Пришлите новость, ссылку или тему — бот будет следить за развитием этой истории и сообщать о существенных изменениях. Закрытый тест: вход по приглашению.', request_timeout=15)
+                await bot.set_my_short_description(short_description='Наблюдение за развитием конкретных историй. Существенные обновления и ссылки на источники.', request_timeout=15)
+                await bot.set_my_commands([
+                    BotCommand(command='start', description='Как работает бот'),
+                    BotCommand(command='watching', description='Мои наблюдения'),
+                    BotCommand(command='check_now', description='Проверить сюжет'),
+                    BotCommand(command='help', description='Помощь'),
+                    BotCommand(command='admin', description='Управление тестом'),
+                ], request_timeout=15)
+            except TelegramAPIError as exc:
+                logging.getLogger(__name__).warning('Profile setup skipped: %s', type(exc).__name__)
             dp = Dispatcher()
             dp.include_router(build_router(service, settings))
             heartbeat_task = asyncio.create_task(bot_heartbeat())

@@ -45,10 +45,10 @@ compose.yaml       bot + worker + отдельный PostgreSQL
 ## API и ключи
 
 1. Создайте бота в [BotFather](https://t.me/BotFather), команда `/newbot`, и сохраните токен в `TELEGRAM_BOT_TOKEN`.
-2. Создайте ключ в [OpenRouter](https://openrouter.ai/settings/keys), пополните баланс и укажите `LLM_API_KEY`. Модель по умолчанию — `google/gemini-2.5-flash-lite`. У провайдера можно дополнительно установить лимит ключа. Поддерживаемые варианты смотрите в `app/ai/client.py`.
+2. Создайте ключ в [OpenRouter](https://openrouter.ai/settings/keys), пополните баланс и укажите `LLM_API_KEY`. Модель по умолчанию — `qwen/qwen3-30b-a3b-instruct-2507`. У провайдера можно дополнительно установить лимит ключа. Поддерживаемые варианты смотрите в `app/ai/client.py`.
 3. Для Bing News RSS/Google News RSS ключ не нужен. Это временный источник MVP без гарантированного SLA. При необходимости выберите поддерживаемый платный провайдер поиска и заполните `SEARCH_API_KEY`.
 
-Текущая проверенная конфигурация OpenRouter использует JSON Schema, затем локальную проверку Pydantic. Документация: [structured outputs](https://openrouter.ai/docs/features/structured-outputs), [карточка модели](https://openrouter.ai/google/gemini-2.5-flash-lite).
+Конфигурация OpenRouter использует JSON Schema, затем локальную проверку Pydantic. Документация: [structured outputs](https://openrouter.ai/docs/features/structured-outputs), [карточка модели](https://openrouter.ai/qwen/qwen3-30b-a3b-instruct-2507). При развёртывании Google и OpenAI вернули 403 с ограничением провайдера; Qwen оказался доступен через тот же ключ.
 
 Секреты находятся только в `.env` на сервере, с правами `0600`. Они не входят в Git, образ Docker или архив исходников. Не включайте отладочное логирование HTTP-заголовков. При изменении `.env` перезапустите процессы через `docker compose up -d --force-recreate bot worker`.
 
