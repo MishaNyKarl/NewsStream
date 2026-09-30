@@ -1,7 +1,7 @@
 """Persistence models. Dates are UTC-aware on PostgreSQL and in SQLite tests."""
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -49,6 +49,11 @@ class Story(Base):
     __table_args__ = (
         CheckConstraint("status IN ('draft','active','paused','deleted')", name="ck_story_status"),
         CheckConstraint("check_frequency_hours > 0", name="ck_story_frequency"),
+        CheckConstraint("monitoring_mode IN ('daily','intensive')", name="ck_story_monitoring_mode"),
+        CheckConstraint("monitoring_mode != 'intensive' OR (intensive_started_at IS NOT NULL AND intensive_until IS NOT NULL)", name="ck_story_intensive_dates"),
+        Index("uq_stories_user_intensive", "user_id", unique=True,
+              postgresql_where=text("monitoring_mode = 'intensive' AND status IN ('active','paused')"),
+              sqlite_where=text("monitoring_mode = 'intensive' AND status IN ('active','paused')")),
         Index("ix_stories_due", "status", "next_check_at"),
         Index("ix_stories_user_status", "user_id", "status"),
     )
@@ -65,6 +70,9 @@ class Story(Base):
     watch_goals: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(16), default="draft")
     check_frequency_hours: Mapped[int] = mapped_column(Integer, default=24)
+    monitoring_mode: Mapped[str] = mapped_column(String(16), default="daily", server_default="daily")
+    intensive_started_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    intensive_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
     last_checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     last_meaningful_update_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     next_check_at: Mapped[datetime | None] = mapped_column(UTCDateTime)

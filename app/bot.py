@@ -6,7 +6,7 @@ import html
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -16,11 +16,16 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.domain import UserError
+from app.monitoring import IntensiveSlotOccupied
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_UNITS = 3900
 DENIED = "Это закрытый тест. Попросите организатора прислать ссылку-приглашение."
 UNEXPECTED = "Не получилось завершить действие. Попробуйте чуть позже. Ваши наблюдения сохранены."
+INTENSIVE_HELP = (
+    "⚡ «Следить внимательнее»: проверки через 30 мин, 1, 2, 4, 8, 12 и 24 ч от включения. "
+    "Затем — обычное расписание. В тесте — <b>одна такая тема на пользователя</b>."
+)
 
 
 def _units(text: str) -> int:
@@ -98,7 +103,7 @@ def _date(value: datetime | None) -> str:
         return "ещё не было"
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    return value.astimezone(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M МСК")
 
 
 def _button(text: str, action: str, object_id: int) -> InlineKeyboardButton:
@@ -143,17 +148,39 @@ def preview_text(story: Any) -> str:
         f"📰 <b>{escaped(story.title, 180)}</b>\n\n"
         f"<b>Что произошло</b>\n{escaped(story.summary, 850)}\n\n"
         f"<b>Буду отслеживать</b>\n{_bullets(story.watch_goals, 5, 250)}\n\n"
-        "Проверьте, верно ли я понял сюжет. Наблюдение начнётся после подтверждения."
+        "Проверьте, верно ли я понял сюжет. Выберите режим:\n\n"
+        f"Обычный — первая проверка после подписки, затем каждые {int(story.check_frequency_hours)} ч.\n\n"
+        + INTENSIVE_HELP
     )
+
+
+def preview_keyboard(story: Any) -> InlineKeyboardMarkup:
+    return _keyboard([_button("✅ Следить", "watch", story.id)],
+                     [_button("⚡ Следить внимательнее", "focus", story.id)],
+                     [_button("❌ Отмена", "cancel", story.id)])
 
 
 def story_text(story: Any) -> str:
     status = {"active": "🟢 Наблюдаю", "paused": "⏸ На паузе"}.get(story.status, "Черновик")
+    intensive = getattr(story, "monitoring_mode", "daily") == "intensive"
+    schedule = (INTENSIVE_HELP + f"\nРежим до: {_date(story.intensive_until)}"
+                if intensive else f"Проверка каждые {int(story.check_frequency_hours)} ч.\n"
+                "В тесте можно выбрать одну тему для режима «Следить внимательнее».")
+    if story.status == "paused":
+        schedule += "\nПроверки приостановлены."
+        if intensive:
+            schedule += " Место занято этой темой; срок режима продолжает идти."
+    else:
+        next_at = getattr(story, "next_check_at", None)
+        next_label = _date(next_at) if next_at else "планируется"
+        if next_at and next_at <= datetime.now(timezone.utc):
+            next_label = "в очереди, начнётся при первой возможности"
+        schedule += f"\nБлижайшая проверка: {next_label}"
     return (
         f"📰 <b>{escaped(story.title, 180)}</b>\n{status} · №{story.id}\n\n"
         f"<b>Что известно сейчас</b>\n{escaped(story.current_state, 1050)}\n\n"
         f"<b>Что отслеживаю</b>\n{_bullets(story.watch_goals, 4, 220)}\n\n"
-        f"Проверка каждые {int(story.check_frequency_hours)} ч.\n"
+        f"{schedule}\n"
         f"Последняя проверка: {_date(getattr(story, 'last_checked_at', None))}\n"
         f"Последнее развитие: {_date(getattr(story, 'last_meaningful_update_at', None))}"
     )
@@ -165,6 +192,10 @@ def story_keyboard(story: Any) -> InlineKeyboardMarkup:
         rows.append([_button("🔎 Проверить сейчас", "check", story.id), _button("⏸ Пауза", "pause", story.id)])
     else:
         rows.append([_button("▶️ Возобновить", "resume", story.id)])
+    if getattr(story, "monitoring_mode", "daily") == "intensive":
+        rows.append([_button("🕒 Вернуть обычный режим", "daily", story.id)])
+    elif story.status == "active":
+        rows.append([_button("⚡ Следить внимательнее", "focus", story.id)])
     rows.extend([
         [_button("🕒 История", "history", story.id), _button("💬 Обсудить", "chat", story.id)],
         [_button("🗑 Удалить", "delete", story.id), _button("📋 Все наблюдения", "list", 0)],
@@ -174,7 +205,7 @@ def story_keyboard(story: Any) -> InlineKeyboardMarkup:
 
 def parse_callback(value: str | None) -> tuple[str, int] | None:
     match = re.fullmatch(
-        r"(watch|cancel|story|check|pause|resume|delete|delete_yes|history|chat|useful|not_useful|list):([0-9]{1,10})",
+        r"(watch|cancel|story|card|focus|daily|check|pause|resume|delete|delete_yes|history|chat|useful|not_useful|list):([0-9]{1,10})",
         value or "",
     )
     if not match:
@@ -184,6 +215,14 @@ def parse_callback(value: str | None) -> tuple[str, int] | None:
     if object_id > 2_147_483_647 or (object_id == 0 and action != "list"):
         return None
     return action, object_id
+
+
+def parse_transfer(value: str | None) -> tuple[int, int] | None:
+    match = re.fullmatch(r"transfer:([1-9][0-9]{0,9}):([1-9][0-9]{0,9})", value or "")
+    if not match:
+        return None
+    target, previous = map(int, match.groups())
+    return (target, previous) if max(target, previous) <= 2_147_483_647 and target != previous else None
 
 
 def _start_argument(message: Message) -> str | None:
@@ -290,10 +329,15 @@ def build_router(service: Any, settings: Any) -> Router:
         rows = []
         for story in stories[:30]:
             icon = "⏸" if story.status == "paused" else "🟢"
+            if getattr(story, "monitoring_mode", "daily") == "intensive":
+                icon += "⚡"
             lines.append(f"{icon} №{story.id} · {escaped(story.title, 75)}")
             title = str(story.title or "Наблюдение").replace("\n", " ")[:38]
             rows.append([_button(f"{icon} {story.id}. {title}", action, story.id)])
         lines.append("\nНажмите на наблюдение. Чтобы добавить новое, просто пришлите ссылку или текст.")
+        focused = next((item for item in stories if getattr(item, "monitoring_mode", "daily") == "intensive"), None)
+        lines.append("\n⚡ В тесте — одна тема с частыми проверками. " + (
+            f"Сейчас: №{focused.id}. Режим можно перенести в карточке другой темы." if focused else "Сейчас место свободно."))
         await _answer(message, "\n".join(lines), _keyboard(*rows))
 
     @router.message(CommandStart())
@@ -303,6 +347,7 @@ def build_router(service: Any, settings: Any) -> Router:
             "📰 <b>Следите за развитием истории</b>\n\n"
             "Пришлите ссылку на новость или напишите, за чем следить. Я покажу, что понял, и попрошу подтвердить наблюдение.\n\n"
             f"Проверяю каждые {int(settings.default_check_interval_hours)} ч. Уведомляю, когда появляются существенные новые сведения. Пересказы стараюсь пропускать.\n\n"
+            + INTENSIVE_HELP + "\n\n"
             "Например: «Когда откроют новую станцию метро и изменились ли сроки?»\n\n"
             "Ваши сюжеты — /watching · Как пользоваться — /help" + ready)
 
@@ -317,6 +362,10 @@ def build_router(service: Any, settings: Any) -> Router:
             f"До {int(settings.max_stories_per_user)} наблюдений на человека. "
             f"Ручных проверок — до {int(settings.max_manual_checks_per_day)} в сутки; "
             f"между ними минимум {int(settings.manual_check_cooldown_seconds)} сек.\n\n"
+            + INTENSIVE_HELP + "\n"
+            "Время считается от включения режима, а не от предыдущей проверки. На паузе срок продолжает идти, "
+            "и тема занимает место до выключения, переноса или окончания режима. "
+            "Ручная проверка не откладывает автоматическую. Уведомления приходят только при новых важных фактах.\n\n"
             "/watching — список, история, пауза и удаление\n"
             "/check_now — проверить выбранное наблюдение\n"
             "/cancel — как отменить создание\n\n"
@@ -372,13 +421,37 @@ def build_router(service: Any, settings: Any) -> Router:
 
     @router.callback_query()
     async def callback(query: CallbackQuery) -> None:
+        transfer = parse_transfer(query.data)
         parsed = parse_callback(query.data)
-        if parsed is None:
+        if parsed is None and transfer is None:
             await query.answer("Эта кнопка устарела. Откройте /watching.", show_alert=True)
             return
-        action, object_id = parsed
+        action, object_id = parsed if parsed else ("focus", transfer[0])
         user_id = query.from_user.id
         message = query.message
+        if action == "focus":
+            await query.answer()
+            try:
+                changed = await service.set_monitoring_mode(user_id, object_id, "intensive",
+                    replace_story_id=transfer[1] if transfer else None)
+            except IntensiveSlotOccupied as exc:
+                await _answer(message,
+                    "⚡ В тесте — <b>одна тема с частыми проверками</b>.\n\n"
+                    f"Сейчас это «{escaped(exc.title, 180)}». Перенести режим на выбранную тему? "
+                    "Прежняя тема вернётся к обычному расписанию; если она на паузе, пауза сохранится.\n\n" + INTENSIVE_HELP,
+                    _keyboard([InlineKeyboardButton(text="⚡ Перенести режим", callback_data=f"transfer:{object_id}:{exc.story_id}")],
+                              [_button("Оставить как есть", "card", object_id)]))
+                return
+            await _replace(message, "✅ Режим «Следить внимательнее» включён.\n\n" + story_text(changed), story_keyboard(changed))
+            return
+        if action == "card":
+            await query.answer()
+            current = await service.get_story(user_id, object_id)
+            if current is None:
+                raise UserError("Наблюдение больше недоступно. Откройте /watching.")
+            await _replace(message, preview_text(current) if current.status == "draft" else story_text(current),
+                           preview_keyboard(current) if current.status == "draft" else story_keyboard(current))
+            return
         if action in {"useful", "not_useful"}:
             saved = await service.give_feedback(user_id, object_id, action)
             await query.answer("Спасибо! Оценка сохранена." if saved else "Обновление больше недоступно.", show_alert=not saved)
@@ -390,7 +463,7 @@ def build_router(service: Any, settings: Any) -> Router:
         if action == "watch":
             await query.answer()
             story = await service.confirm_story(user_id, object_id)
-            await _replace(message, f"✅ Наблюдение создано. Проверю развитие истории автоматически каждые {int(story.check_frequency_hours)} ч.\n\n" + story_text(story), story_keyboard(story))
+            await _replace(message, "✅ Наблюдение создано.\n\n" + story_text(story), story_keyboard(story))
             return
         if action == "cancel":
             await query.answer()
@@ -407,6 +480,9 @@ def build_router(service: Any, settings: Any) -> Router:
         await query.answer()
         if action == "story":
             await _answer(message, story_text(story), story_keyboard(story))
+        elif action == "daily":
+            changed = await service.set_monitoring_mode(user_id, object_id, "daily")
+            await _replace(message, "✅ В этой теме обычный режим.\n\n" + story_text(changed), story_keyboard(changed))
         elif action == "check":
             await _answer(message, escaped(await service.request_check(user_id, object_id), 1500))
         elif action in {"pause", "resume"}:
@@ -445,9 +521,7 @@ def build_router(service: Any, settings: Any) -> Router:
             raise UserError("Анализ пока недоступен: администратору нужно настроить API-ключ LLM. Попробуйте позже.")
         await _answer(message, "🔎 Разбираюсь в сюжете и формулирую, за чем следить…")
         story = await service.prepare_story(message.from_user.id, text)
-        await _answer(message, preview_text(story), _keyboard([
-            _button("✅ Следить", "watch", story.id), _button("❌ Отмена", "cancel", story.id),
-        ]))
+        await _answer(message, preview_text(story), preview_keyboard(story))
 
     @router.message()
     async def unsupported(message: Message) -> None:

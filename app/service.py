@@ -114,6 +114,9 @@ class BotService:
     async def confirm_story(self, user_id, story_id):
         return await self.repo.activate_story(user_id, story_id)
 
+    async def set_monitoring_mode(self, user_id, story_id, mode, replace_story_id=None):
+        return await self.repo.set_monitoring_mode(user_id, story_id, mode, replace_story_id)
+
     async def cancel_draft(self, user_id, story_id):
         story = await self.repo.get_story(user_id, story_id)
         if story and story.status == 'draft':

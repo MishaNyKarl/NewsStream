@@ -20,6 +20,7 @@ from sqlalchemy import delete, func, or_, select, text, update
 
 from app.domain import Analysis, Candidate, StoryExtraction, UserError
 from app.models import Feedback, Source, Story, StoryUpdate, UsageEvent, User, utcnow
+from app.monitoring import INTENSIVE_DURATION, IntensiveSlotOccupied, completion_next, next_checkpoint
 
 _sqlite_locks = WeakKeyDictionary()
 _ADMISSION_LOCK = 419281701
@@ -74,6 +75,68 @@ class Repository:
     def _event(session, operation, user_id=None, story_id=None, **kwargs):
         session.add(UsageEvent(operation=operation, user_id=user_id, story_id=story_id, **kwargs))
 
+    @staticmethod
+    def _daily(story):
+        story.monitoring_mode = "daily"
+        story.intensive_started_at = story.intensive_until = None
+
+    async def _expire_intensive(self, session, user_id=None):
+        query = select(Story).where(Story.monitoring_mode == "intensive",
+            Story.intensive_until <= utcnow(), Story.status.in_(("active", "paused")))
+        if user_id is not None:
+            query = query.where(Story.user_id == user_id)
+        for story in (await session.scalars(query.order_by(Story.id).with_for_update(key_share=True))).all():
+            self._daily(story)
+            self._event(session, "intensive_expired", story.user_id, story.id)
+        await session.flush()
+
+    async def set_monitoring_mode(self, user_id, story_id, mode, replace_story_id=None):
+        """Atomic assignment/transfer. Expected previous owner prevents stale confirmations."""
+        if mode not in ("daily", "intensive"):
+            raise ValueError("Unsupported monitoring mode")
+        async with self._transaction() as session:
+            user = await session.scalar(select(User).where(User.telegram_id == user_id).with_for_update(key_share=True))
+            if user is None:
+                raise UserError("Сначала откройте доступ через /start.")
+            # Consistent ID order for operations touching multiple stories.
+            stories = list((await session.scalars(select(Story).where(Story.user_id == user_id,
+                Story.status != "deleted").order_by(Story.id).with_for_update(key_share=True))).all())
+            now = utcnow()
+            for item in stories:
+                if item.monitoring_mode == "intensive" and item.intensive_until <= now:
+                    self._daily(item)
+                    self._event(session, "intensive_expired", user_id, item.id)
+            story = next((item for item in stories if item.id == story_id), None)
+            if story is None:
+                raise UserError("Наблюдение больше недоступно. Откройте /watching.")
+            if mode == "daily":
+                if story.monitoring_mode == "intensive":
+                    self._daily(story)
+                    story.next_check_at = now + timedelta(hours=story.check_frequency_hours) if story.status == "active" else None
+                    self._event(session, "intensive_disabled", user_id, story.id)
+                return story
+            if story.monitoring_mode == "intensive":
+                return story  # Repeated taps do not restart the window.
+            current = next((item for item in stories if item.monitoring_mode == "intensive"), None)
+            if current is not None and current.id != replace_story_id:
+                raise IntensiveSlotOccupied(current.id, current.title)
+            if current is not None:
+                self._daily(current)
+                current.next_check_at = now + timedelta(hours=current.check_frequency_hours) if current.status == "active" else None
+                self._event(session, "intensive_transferred_from", user_id, current.id)
+            # Release the partial unique index before assigning the new topic.
+            await session.flush()
+            if story.status == "draft":
+                story.status = "active"
+                self._event(session, "story_created", user_id, story.id)
+            story.monitoring_mode = "intensive"
+            story.intensive_started_at = now
+            story.intensive_until = now + INTENSIVE_DURATION
+            story.next_check_at = next_checkpoint(now, now) if story.status == "active" else None
+            story.updated_at = now
+            self._event(session, "intensive_enabled", user_id, story.id)
+            return story
+
     async def get_user(self, user_id):
         async with self._transaction() as session:
             return await session.get(User, user_id)
@@ -120,6 +183,7 @@ class Repository:
         story.search_queries = []
         story.watch_goals = []
         story.status = "deleted"
+        self._daily(story)
         story.lock_until = story.lock_token = story.next_check_at = None
         story.updated_at = utcnow()
 
@@ -163,11 +227,13 @@ class Repository:
 
     async def list_stories(self, user_id):
         async with self._transaction() as session:
+            await self._expire_intensive(session, user_id)
             return list((await session.scalars(select(Story).where(Story.user_id == user_id,
                 Story.status.in_(("active", "paused"))).order_by(Story.created_at.desc(), Story.id.desc()))).all())
 
     async def get_story(self, user_id, story_id):
         async with self._transaction() as session:
+            await self._expire_intensive(session, user_id)
             return await session.scalar(select(Story).where(Story.id == story_id,
                 Story.user_id == user_id, Story.status != "deleted"))
 
@@ -185,10 +251,14 @@ class Repository:
             elif story.status == "draft":
                 raise UserError("Сначала подтвердите создание наблюдения.")
             elif story.status != status:
+                if story.monitoring_mode == "intensive" and story.intensive_until <= utcnow():
+                    self._daily(story)
                 story.status = status
                 story.lock_until = story.lock_token = None
                 story.updated_at = utcnow()
                 story.next_check_at = utcnow() if status == "active" else None
+                if status == "active" and story.monitoring_mode == "intensive":
+                    story.next_check_at = next_checkpoint(story.intensive_started_at, utcnow())
                 self._event(session, "story_resumed" if status == "active" else "story_paused", user_id, story.id)
             return story
 
@@ -233,6 +303,7 @@ class Repository:
 
     async def due_story_ids(self, limit=20):
         async with self._transaction() as session:
+            await self._expire_intensive(session)
             now = utcnow()
             return list((await session.scalars(select(Story.id).where(
                 Story.status == "active", Story.next_check_at <= now,
@@ -248,7 +319,10 @@ class Repository:
             if story.lock_until is None or story.lock_until <= now:
                 return
             story.lock_until = story.lock_token = None
-            story.next_check_at = now + (timedelta(minutes=30) if error else timedelta(hours=story.check_frequency_hours))
+            story.next_check_at = completion_next(story, now, error)
+            if story.monitoring_mode == "intensive" and story.intensive_until <= now:
+                self._daily(story)
+                self._event(session, "intensive_expired", story.user_id, story.id)
             story.updated_at = now
             if not error:
                 story.last_checked_at = now
