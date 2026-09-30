@@ -38,6 +38,7 @@ async def main(role='bot'):
                 await bot.set_my_commands([
                     BotCommand(command='start', description='Как работает бот'),
                     BotCommand(command='watching', description='Мои наблюдения'),
+                    BotCommand(command='journal', description='Журнал уведомлений'),
                     BotCommand(command='interests', description='Мои интересы'),
                     BotCommand(command='check_now', description='Проверить сюжет'),
                     BotCommand(command='help', description='Помощь'),

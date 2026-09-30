@@ -450,6 +450,29 @@ class Repository:
                 .where(Story.user_id == user_id, Story.id == story_id, Story.status != "deleted")
                 .order_by(StoryUpdate.created_at.desc(), StoryUpdate.id.desc()).limit(max(0, min(limit, 20))))).all())
 
+    async def list_notifications(self, user_id, window, before_id=0, limit=9):
+        async with self._transaction() as session:
+            query = select(StoryUpdate, Story).join(Story, Story.id == StoryUpdate.story_id).where(
+                Story.user_id == user_id, Story.status != 'deleted',
+                StoryUpdate.notified_at >= window.since, StoryUpdate.notified_at < window.until)
+            if before_id:
+                cursor = (await session.execute(query.where(StoryUpdate.id == before_id))).first()
+                if cursor is None:
+                    raise UserError('Эта страница больше недоступна. Откройте журнал заново: /journal.')
+                last = cursor[0]
+                query = query.where(or_(StoryUpdate.notified_at < last.notified_at,
+                    (StoryUpdate.notified_at == last.notified_at) & (StoryUpdate.id < last.id)))
+            rows = (await session.execute(query.order_by(StoryUpdate.notified_at.desc(), StoryUpdate.id.desc())
+                                          .limit(max(1, min(limit, 9))))).all()
+            return [(item, story) for item, story in rows]
+
+    async def get_notification(self, user_id, update_id, window):
+        async with self._transaction() as session:
+            row = (await session.execute(select(StoryUpdate, Story).join(Story, Story.id == StoryUpdate.story_id)
+                .where(StoryUpdate.id == update_id, Story.user_id == user_id, Story.status != 'deleted',
+                    StoryUpdate.notified_at >= window.since, StoryUpdate.notified_at < window.until))).first()
+            return (row[0], row[1]) if row else None
+
     async def feedback(self, user_id, update_id, kind):
         if kind not in ("useful", "not_useful"):
             return False
@@ -483,7 +506,7 @@ class Repository:
                 self._delivery_tokens[item.id] = item.delivery_lock_token
             return [(item, story) for item, story in rows]
 
-    async def mark_notified(self, update_id, success: bool, delivery_token=None):
+    async def mark_notified(self, update_id, success: bool, delivery_token=None, telegram_message_id=None):
         token = delivery_token or self._delivery_tokens.get(update_id)
         if not token:
             return
@@ -496,6 +519,8 @@ class Repository:
             item.delivery_lock_token = None
             if success:
                 item.notified_at = now
+                if type(telegram_message_id) is int and telegram_message_id > 0:
+                    item.telegram_message_id = telegram_message_id
                 item.delivery_locked_until = None
                 self._event(session, "notification_sent", story_id=item.story_id)
             else:

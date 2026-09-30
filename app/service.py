@@ -137,6 +137,12 @@ class BotService:
     async def save_interest(self, user_id, story_id):
         return await self.repo.save_interest(user_id, story_id)
 
+    async def list_notifications(self, user_id, window, before_id=0):
+        return await self.repo.list_notifications(user_id, window, before_id=before_id)
+
+    async def get_notification(self, user_id, update_id, window):
+        return await self.repo.get_notification(user_id, update_id, window)
+
     async def list_interests(self, user_id, before_id=0):
         return await self.repo.list_interests(user_id, before_id=before_id)
 

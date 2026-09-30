@@ -127,7 +127,8 @@ class UserInterest(Base):
 class StoryUpdate(Base):
     __tablename__ = "story_updates"
     __table_args__ = (Index("ix_updates_outbox", "notified_at", "delivery_locked_until"),
-                     CheckConstraint("update_kind IN ('development','context')", name="ck_update_kind"))
+                     CheckConstraint("update_kind IN ('development','context')", name="ck_update_kind"),
+                     Index("ix_updates_journal", "story_id", "notified_at", "id"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"), index=True)
     summary: Mapped[str] = mapped_column(Text)
@@ -142,6 +143,7 @@ class StoryUpdate(Base):
     update_kind: Mapped[str] = mapped_column(String(16), default="development", server_default="development")
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     notified_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
     delivery_attempts: Mapped[int] = mapped_column(Integer, default=0)
     delivery_locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
     delivery_lock_token: Mapped[str | None] = mapped_column(String(64))

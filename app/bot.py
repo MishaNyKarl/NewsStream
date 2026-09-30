@@ -14,10 +14,11 @@ from urllib.parse import urlsplit
 from aiogram import BaseMiddleware, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters
 
 from app.domain import UserError
 from app.monitoring import IntensiveSlotOccupied
+from app.journal import DATE_HELP, DATE_PROMPT, PAGE_SIZE, date_window, parse_journal_callback, preset_window
 from app.telegram_progress import ProgressEditBudget, TelegramProgress
 from app.telegram_input import AlbumMiddleware, extract_story_input
 
@@ -148,6 +149,7 @@ def notification_keyboard(story: Any, update: Any) -> InlineKeyboardMarkup:
         [_button("⭐ Интересна тема", "interest", story.id)],
         [_button("⏸ Пауза", "pause", story.id), _button("🕒 История", "history", story.id)],
         [_button("💬 Обсудить", "chat", story.id)],
+        [InlineKeyboardButton(text="🗂 Журнал уведомлений", callback_data="jp:week")],
     ])
     return _keyboard(*rows)
 
@@ -378,7 +380,8 @@ def build_router(service: Any, settings: Any) -> Router:
         stories = await service.list_stories(user_id)
         if not stories:
             await _answer(message, "Наблюдений пока нет. Пришлите ссылку на новость или напишите, за каким сюжетом следить.",
-                          _keyboard([_button("⭐ Мои интересы", "interests", 0)]))
+                          _keyboard([_button("⭐ Мои интересы", "interests", 0)],
+                                    [InlineKeyboardButton(text="🗂 Журнал уведомлений", callback_data="jp:week")]))
             return
         heading = "Какое наблюдение проверить?" if action == "check" else "📋 <b>Мои наблюдения</b>"
         lines = [heading]
@@ -395,6 +398,7 @@ def build_router(service: Any, settings: Any) -> Router:
         lines.append("\n⚡ В тесте — одна тема с частыми проверками. " + (
             f"Сейчас: №{focused.id}. Режим можно перенести в карточке другой темы." if focused else "Сейчас место свободно."))
         rows.append([_button("⭐ Мои интересы", "interests", 0)])
+        rows.append([InlineKeyboardButton(text="🗂 Журнал уведомлений", callback_data="jp:week")])
         await _answer(message, "\n".join(lines), _keyboard(*rows))
 
     async def show_interests(message: Message, user_id: int, before_id=0, replace=False):
@@ -413,6 +417,101 @@ def build_router(service: Any, settings: Any) -> Router:
                      "Пока пусто. Пришлите новость или текст и выберите «⭐ Просто интересна тема». Можно также отметить интерес в существующем наблюдении.")
         await (_replace if replace else _answer)(message, text, _keyboard(*rows))
 
+    async def ask_journal_dates(message, error=None):
+        text = DATE_PROMPT + '\n\n' + (str(error) if error else DATE_HELP)
+        await message.answer(escaped(text, 1800), parse_mode='HTML',
+                             reply_markup=ForceReply(input_field_placeholder='23.09.2026 30.09.2026', selective=True))
+
+    async def show_journal(message, user_id, window=None, cursor=0, replace=False):
+        window = window or preset_window()
+        items = await service.list_notifications(user_id, window, before_id=cursor)
+        rows = []
+        for update, story in items[:PAGE_SIZE]:
+            icon = '🧪' if update.is_demo else ('📌' if update.update_kind == 'context' else '🔔')
+            title = str(story.title).replace('\n', ' ')[:38]
+            label = f'{icon} {_date(update.notified_at)[0:5]} {_date(update.notified_at)[11:16]} · {title}'
+            rows.append([InlineKeyboardButton(text=label, callback_data=window.callback('ju', cursor, update.id))])
+        navigation = []
+        if cursor:
+            navigation.append(InlineKeyboardButton(text='← К началу периода', callback_data=window.callback()))
+        if len(items) > PAGE_SIZE:
+            navigation.append(InlineKeyboardButton(text='Дальше →', callback_data=window.callback(cursor=items[PAGE_SIZE-1][0].id)))
+        if navigation:
+            rows.append(navigation)
+        for choices in [(('Сегодня', 'today'), ('24 часа', 'day'), ('7 дней', 'week')),
+                        (('30 дней', 'month'), ('Всё время', 'all'), ('📅 Даты', 'custom'))]:
+            rows.append([InlineKeyboardButton(text=label, callback_data=f'jp:{key}') for label, key in choices])
+        rows.append([_button('📋 Мои наблюдения', 'list', 0)])
+        body = ('Нажмите на уведомление. Последние — сверху.' if items else
+                'За этот период уведомлений нет. Выберите другой период или вернитесь позже.')
+        text = ('🗂 <b>Журнал уведомлений</b>\n' + escaped(window.label, 160) + '\n\n' + body +
+                '\n\n🔔 Развитие · 📌 Уточнение · 🧪 Демо\n'
+                'Период считается по времени отправки. История удаляется вместе с наблюдением.')
+        await (_replace if replace else _answer)(message, text, _keyboard(*rows))
+
+    @router.message(Command('journal'), ~F.forward_origin)
+    async def journal_command(message: Message, command: CommandObject):
+        window = date_window(command.args) if command.args else preset_window()
+        await show_journal(message, message.from_user.id, window)
+
+    @router.message(F.text, ~F.text.startswith('/'), ~F.forward_origin,
+                    F.reply_to_message.from_user.is_bot, F.reply_to_message.text.startswith(DATE_PROMPT))
+    async def journal_dates_reply(message: Message):
+        if message.reply_to_message.from_user.id != message.bot.id:
+            raise UserError('Откройте выбор периода через /journal.')
+        try:
+            window = date_window(message.text)
+        except UserError as exc:
+            await ask_journal_dates(message, exc)
+            return
+        await show_journal(message, message.from_user.id, window)
+
+    async def journal_callback(query):
+        data = query.data or ''
+        if data.startswith('jp:'):
+            period = data[3:]
+            if period not in {'today', 'day', 'week', 'month', 'all', 'custom'}:
+                await query.answer('Кнопка устарела. Откройте /journal.', show_alert=True)
+                return
+            await query.answer()
+            if period == 'custom':
+                await ask_journal_dates(query.message)
+            else:
+                await show_journal(query.message, query.from_user.id, preset_window(period), replace=True)
+            return
+        parsed = parse_journal_callback(data)
+        if parsed is None:
+            await query.answer('Кнопка устарела. Откройте /journal.', show_alert=True)
+            return
+        action, window, cursor, update_id = parsed
+        if action == 'jn':
+            await query.answer()
+            await show_journal(query.message, query.from_user.id, window, cursor, replace=True)
+            return
+        item = await service.get_notification(query.from_user.id, update_id, window)
+        if item is None:
+            await query.answer('Уведомление удалено или недоступно в этом периоде.', show_alert=True)
+            return
+        update, story = item
+        await query.answer()
+        text = f'🗂 Отправлено: {_date(update.notified_at)}\n\n' + notification_text(story, update)
+        rows = list(notification_keyboard(story, update).inline_keyboard)
+        rows.pop()  # Replace generic journal shortcut with this exact period/page.
+        rows.append([_button('📋 Открыть тему', 'story', story.id)])
+        anchor = getattr(update, 'telegram_message_id', None)
+        if action == 'ju' and anchor:
+            rows.append([InlineKeyboardButton(text='↩ Показать в чате', callback_data=window.callback('jo', cursor, update.id))])
+        rows.append([InlineKeyboardButton(text='← Назад в журнал', callback_data=window.callback(cursor=cursor))])
+        keyboard = _keyboard(*rows)
+        if action == 'jo':
+            # Private bot chats have no public post links. A reply points back
+            # to the actual message; if it was deleted, the saved card still opens.
+            await query.message.answer(text, parse_mode='HTML', reply_markup=keyboard,
+                disable_web_page_preview=True,
+                reply_parameters=ReplyParameters(message_id=anchor, allow_sending_without_reply=True) if anchor else None)
+        else:
+            await _replace(query.message, text, keyboard)
+
     @router.message(CommandStart(), ~F.forward_origin)
     async def start(message: Message) -> None:
         ready = "" if service.provider_ready() else "\n\n⚙️ Анализ временно недоступен: администратору нужно настроить API-ключ LLM."
@@ -423,8 +522,9 @@ def build_router(service: Any, settings: Any) -> Router:
             + INTENSIVE_HELP + "\n\n"
             "Например: «Когда откроют новую станцию метро и изменились ли сроки?»\n\n"
             "Можно выбрать «⭐ Просто интересна тема» — запомню интерес для будущих подборок без запуска наблюдения.\n\n"
-            "Ваши сюжеты — /watching · Мои интересы — /interests · Помощь — /help" + ready,
-            _keyboard([_button("📋 Мои наблюдения", "list", 0), _button("⭐ Мои интересы", "interests", 0)]))
+            "Ваши сюжеты — /watching · Журнал — /journal · Мои интересы — /interests · Помощь — /help" + ready,
+            _keyboard([_button("📋 Мои наблюдения", "list", 0), _button("⭐ Мои интересы", "interests", 0)],
+                      [InlineKeyboardButton(text='🗂 Журнал уведомлений', callback_data='jp:week')]))
 
     @router.message(Command("help"), ~F.forward_origin)
     async def help_command(message: Message) -> None:
@@ -442,6 +542,7 @@ def build_router(service: Any, settings: Any) -> Router:
             "и тема занимает место до выключения, переноса или окончания режима. "
             "Ручная проверка не откладывает автоматическую. Уведомления приходят только при новых важных фактах.\n\n"
             "/watching — список, история, пауза и удаление\n"
+            "/journal — все отправленные уведомления с выбором периода\n"
             "/interests — ваши интересы для будущих подборок; просмотр и удаление\n"
             "/check_now — проверить выбранное наблюдение\n"
             "/cancel — как отменить создание\n\n"
@@ -501,6 +602,9 @@ def build_router(service: Any, settings: Any) -> Router:
 
     @router.callback_query()
     async def callback(query: CallbackQuery) -> None:
+        if (query.data or '').startswith(('jp:', 'jn:', 'ju:', 'jo:')):
+            await journal_callback(query)
+            return
         transfer = parse_transfer(query.data)
         parsed = parse_callback(query.data)
         if parsed is None and transfer is None:

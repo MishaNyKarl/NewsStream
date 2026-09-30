@@ -12,12 +12,14 @@ log = logging.getLogger(__name__)
 async def deliver_notifications(service, bot):
     for update, story in await service.repo.pending_notifications(limit=1):
         success = False
+        message_id = None
         try:
             # Recheck immediately before delivering to respect pause/delete.
             fresh = await service.repo.get_story(story.user_id, story.id)
             if fresh and fresh.status == 'active':
-                await bot.send_message(story.user_id, notification_text(story, update),
+                message = await bot.send_message(story.user_id, notification_text(story, update),
                     reply_markup=notification_keyboard(story, update), request_timeout=30)
+                message_id = message.message_id
                 success = True
         except TelegramForbiddenError:
             await service.repo.set_status(story.user_id, story.id, 'paused')
@@ -25,7 +27,8 @@ async def deliver_notifications(service, bot):
             await asyncio.sleep(min(exc.retry_after, 30))
         except Exception as exc:
             await service._error('notification', exc, story_id=story.id, user_id=story.user_id)
-        await service.repo.mark_notified(update.id, success, delivery_token=update.delivery_lock_token)
+        await service.repo.mark_notified(update.id, success, delivery_token=update.delivery_lock_token,
+                                        telegram_message_id=message_id)
 
 async def run_worker(service, bot):
     heartbeat = Path(tempfile.gettempdir()) / 'newswatch-worker-heartbeat'
