@@ -3,9 +3,10 @@ import asyncio
 import html
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
 from app.progress import ProgressEvent
 
@@ -14,6 +15,64 @@ EDIT_TIMEOUT = 4
 # Keep terminal retries alive without occupying analysis slots. They only edit
 # an existing message, expire after two minutes and never trigger another check.
 _terminal_tasks: set[asyncio.Task] = set()
+MSK = timezone(timedelta(hours=3))
+
+
+def stage_index(operation, event):
+    if operation == "check":
+        return {"searching": 0, "reading_sources": 1, "analyzing": 2,
+                "model_wait": 2, "saving_result": 3}.get(event.stage)
+    return {"starting": 0, "reading_input": 0, "extracting": 1,
+            "model_wait": 1, "saving_draft": 2}.get(event.stage)
+
+
+def stage_bar(operation, event, visited=None, status=None):
+    """A work-stage indicator, never an estimate of time or percentage.
+
+    A dash means a stage was skipped. An error leaves later stages empty.
+    Only observed stages can become completed segments.
+    """
+    count = 4 if operation == "check" else 3
+    current = stage_index(operation, event)
+    seen = set(visited or ())
+    if current is not None:
+        seen.add(current)
+    successful = status in {"completed", "changed", "unchanged", "no_sources"}
+    segments = []
+    for index in range(count):
+        if status and not successful and index == current:
+            segment = "×××"
+        elif status is None and index == current:
+            segment = "▸▸▸"
+        elif index in seen:
+            segment = "■■■"
+        elif successful or (current is not None and index < current):
+            segment = "───"
+        else:
+            segment = "□□□"
+        segments.append(segment)
+    if status:
+        label = ("Готово" if successful else "Остановлено" if status == "cancelled" else "Не завершено")
+    else:
+        label = f"{current + 1}/{count}" if current is not None else "Подготовка"
+    line = f"<code>{' '.join(segments)}</code> · {label}"
+    if "───" in segments:
+        line += "\n─ этап не понадобился"
+    return line
+
+
+def time_footer(elapsed, started_at=None, finished_at=None):
+    label = "Заняло" if finished_at else "Прошло"
+    text = f"⏱ {label}: {elapsed_text(elapsed)}"
+    if started_at is not None:
+        start = started_at.astimezone(MSK)
+        if finished_at is None:
+            text += f"\n🗓 Старт: {start:%d.%m.%Y · %H:%M:%S} МСК"
+        else:
+            end = finished_at.astimezone(MSK)
+            end_text = end.strftime("%H:%M:%S" if start.date() == end.date() else "%d.%m.%Y · %H:%M:%S")
+            text += f"\n🗓 {start:%d.%m.%Y · %H:%M:%S} → {end_text} МСК"
+    return text
 
 
 def elapsed_text(seconds):
@@ -22,7 +81,7 @@ def elapsed_text(seconds):
     return f"{minutes} мин {seconds:02d} с" if minutes else f"{seconds} с"
 
 
-def progress_text(operation, story_id, event, elapsed, stage_elapsed):
+def progress_text(operation, story_id, event, elapsed, stage_elapsed, *, started_at=None, visited=None):
     heading = f"Проверяю тему №{story_id}" if operation == "check" else "Готовлю наблюдение"
     data = event.data
     stages = {
@@ -50,10 +109,11 @@ def progress_text(operation, story_id, event, elapsed, stage_elapsed):
         details = f"\nНовых материалов для анализа: {data.get('sources', 0)}."
     if stage_elapsed >= 30:
         details += "\nТекущий этап ещё выполняется."
-    return f"<b>{heading}</b>\n\n{stage}{details}\n\nПрошло: {elapsed_text(elapsed)}"
+    bar = stage_bar(operation, event, visited)
+    return f"<b>{heading}</b>\n{bar}\n\n{stage}{details}\n\n{time_footer(elapsed, started_at)}"
 
 
-def outcome_text(outcome, elapsed):
+def outcome_text(outcome, elapsed=None):
     if outcome.status == "changed":
         body = "✅ Проверка завершена. Найдено существенное развитие.\nПодробности — в отдельном уведомлении и истории темы."
     elif outcome.status == "unchanged":
@@ -68,18 +128,20 @@ def outcome_text(outcome, elapsed):
         body += f"\nНовых материалов проверено: {outcome.sources}."
     if outcome.partial_search:
         body += "\nЧасть поисковых запросов была недоступна — результат неполный."
-    return body + f"\n\nВремя: {elapsed_text(elapsed)}"
+    return body + (f"\n\nВремя: {elapsed_text(elapsed)}" if elapsed is not None else "")
 
 
 class TelegramProgress:
     def __init__(self, message, operation, story_id=None, clock=time.monotonic,
-                 refresh_seconds=10, min_edit_seconds=2):
+                 refresh_seconds=10, min_edit_seconds=2, started_at=None):
         self.message = message
         self.operation = operation
         self.story_id = story_id
         self.clock = clock
         self.started = self.stage_started = clock()
+        self.started_at = started_at or datetime.now(timezone.utc)
         self.event = ProgressEvent("starting")
+        self.visited = {0} if operation == "prepare" else set()
         self.refresh_seconds = refresh_seconds
         self.min_edit_seconds = min_edit_seconds
         self._wake = asyncio.Event()
@@ -89,6 +151,26 @@ class TelegramProgress:
         self._last_text = None
         self._retry_at = 0
         self._terminal_task = None
+
+    @classmethod
+    async def begin(cls, message, operation, story_id=None):
+        display = cls(message, operation, story_id)
+        text = progress_text(operation, story_id, display.event, 0, 0,
+                             started_at=display.started_at, visited=display.visited)
+        # When a button belongs to a reply card, preserve the original user's
+        # message as the anchor. Otherwise reply to the command/post/card itself.
+        target = message
+        original = message.reply_to_message
+        if (message.from_user and message.from_user.is_bot and original
+                and original.from_user and not original.from_user.is_bot
+                and original.chat.id == message.chat.id):
+            target = original
+        display.message = await message.answer(
+            text, parse_mode="HTML", reply_markup=display.keyboard(), disable_web_page_preview=True,
+            reply_parameters=ReplyParameters(message_id=target.message_id, allow_sending_without_reply=True))
+        display._last_text = text
+        display.start()
+        return display
 
     def keyboard(self):
         if self.story_id is None:
@@ -105,6 +187,9 @@ class TelegramProgress:
         if event.stage != self.event.stage:
             self.stage_started = self.clock()
         self.event = ProgressEvent(event.stage, {**self.event.data, **event.data})
+        index = stage_index(self.operation, self.event)
+        if index is not None:
+            self.visited.add(index)
         self._wake.set()
 
     async def _edit(self, text, keyboard=None):
@@ -163,13 +248,18 @@ class TelegramProgress:
             if self._closed or self._unavailable:
                 return
             text = progress_text(self.operation, self.story_id, self.event,
-                                 self.clock() - self.started, self.clock() - self.stage_started)
+                                 self.clock() - self.started, self.clock() - self.stage_started,
+                                 started_at=self.started_at, visited=self.visited)
             await self._edit(text, self.keyboard())
             next_edit = self.clock() + self.min_edit_seconds
 
-    async def finish(self, text, keyboard=None):
+    async def finish(self, text, keyboard=None, *, status="completed"):
         if self._closed:
             return
+        heading = f"<b>Проверка темы №{self.story_id}</b>\n" if self.operation == "check" else ""
+        bar = stage_bar(self.operation, self.event, self.visited, status)
+        footer = time_footer(self.clock() - self.started, self.started_at, datetime.now(timezone.utc))
+        text = f"{heading}{bar}\n\n{text}\n\n{footer}"
         self._closed = True
         self._wake.set()
         if self._task is not None:
@@ -188,4 +278,4 @@ class TelegramProgress:
             pass
 
     async def complete(self, outcome):
-        await self.finish(outcome_text(outcome, self.clock() - self.started), self.keyboard())
+        await self.finish(outcome_text(outcome), self.keyboard(), status=outcome.status)

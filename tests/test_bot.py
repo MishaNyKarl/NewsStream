@@ -87,8 +87,8 @@ class Harness:
         self.counter += 1
         await self.dispatcher.feed_update(self.bot, update)
 
-    async def callback(self, data):
-        message = Message(message_id=1, date=NOW, chat=Chat(id=100, type="private"), text="Card")
+    async def callback(self, data, **message_fields):
+        message = Message(message_id=1, date=NOW, chat=Chat(id=100, type="private"), text="Card", **message_fields)
         callback = CallbackQuery(id=str(self.counter), from_user=User(id=100, is_bot=False, first_name="Tester"),
                                  chat_instance="test", data=data, message=message)
         update = Update(update_id=self.counter, callback_query=callback)

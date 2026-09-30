@@ -331,19 +331,18 @@ def build_router(service: Any, settings: Any) -> Router:
     router.callback_query.outer_middleware(access)
 
     async def run_manual_check(message, user_id, story_id):
-        sent = await _answer(message, f"⏳ Запускаю проверку темы №{story_id}…")
-        progress = TelegramProgress(sent, "check", story_id)
-        progress.start()
+        progress = await TelegramProgress.begin(message, "check", story_id)
         try:
             await service.request_check(user_id, story_id, progress=progress.update, on_complete=progress.complete)
         except UserError as exc:
-            await progress.finish("⚠️ " + escaped(str(exc), 1800), progress.keyboard())
+            await progress.finish("⚠️ " + escaped(str(exc), 1800), progress.keyboard(), status="error")
         except asyncio.CancelledError:
-            await progress.finish("⏹ Запуск проверки прерван. Откройте тему и попробуйте снова.", progress.keyboard())
+            await progress.finish("⏹ Запуск проверки прерван. Откройте тему и попробуйте снова.",
+                                  progress.keyboard(), status="cancelled")
             raise
         except Exception as exc:
             logger.error("manual_start_failed error_type=%s", type(exc).__name__)
-            await progress.finish(UNEXPECTED, progress.keyboard())
+            await progress.finish(UNEXPECTED, progress.keyboard(), status="error")
 
     async def show_list(message: Message, user_id: int, action: str = "story") -> None:
         stories = await service.list_stories(user_id)
@@ -545,20 +544,18 @@ def build_router(service: Any, settings: Any) -> Router:
             raise UserError("Текст слишком длинный. Пришлите ссылку или описание до 10 000 символов.")
         if not service.provider_ready():
             raise UserError("Анализ пока недоступен: администратору нужно настроить API-ключ LLM. Попробуйте позже.")
-        sent = await _answer(message, "⏳ Принимаю новость… Здесь появятся этапы работы и готовая карточка.")
-        progress = TelegramProgress(sent, "prepare")
-        progress.start()
+        progress = await TelegramProgress.begin(message, "prepare")
         try:
             options = {'source_url': seed.source_url, 'use_text': True} if seed.use_text else {}
             story = await service.prepare_story(message.from_user.id, text, progress=progress.update, **options)
         except UserError as exc:
-            await progress.finish("⚠️ " + escaped(str(exc), 1800))
+            await progress.finish("⚠️ " + escaped(str(exc), 1800), status="error")
         except asyncio.CancelledError:
-            await progress.finish("⏹ Подготовка прервана. Пришлите новость ещё раз.")
+            await progress.finish("⏹ Подготовка прервана. Пришлите новость ещё раз.", status="cancelled")
             raise
         except Exception as exc:
             logger.error("story_prepare_failed error_type=%s", type(exc).__name__)
-            await progress.finish(UNEXPECTED)
+            await progress.finish(UNEXPECTED, status="error")
         else:
             await progress.finish(preview_text(story), preview_keyboard(story))
 
