@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from app.ai.prompts import ANALYZE, EXTRACT
 from app.domain import Analysis, Candidate, ProviderUnavailable, StoryExtraction
+from app.progress import report
 
 AI_ERROR = 'Сервис анализа временно недоступен. Попробуйте позже; наблюдения сохранены.'
 
@@ -77,6 +78,7 @@ class AIClient:
         # Local Pydantic validation remains mandatory on both attempts.
         if attempt > 0:
             request['response_format'] = {'type': 'json_object'}
+        await report('model_wait', purpose=purpose, attempt=attempt + 1)
         try:
             session = await self._get_session()
             async with session.post(endpoint, headers=headers, json=request, allow_redirects=False) as response:

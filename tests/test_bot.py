@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 from aiogram import Bot, Dispatcher
@@ -50,7 +50,7 @@ class FakeSession(BaseSession):
             return User(id=777, is_bot=True, first_name="Test", username="news_test_bot")
         if isinstance(method, AnswerCallbackQuery):
             return True
-        return Message(message_id=99, date=NOW, chat=Chat(id=100, type="private"), text=getattr(method, "text", ""))
+        return Message(message_id=99, date=NOW, chat=Chat(id=100, type="private"), text=getattr(method, "text", "")).as_(bot)
 
     async def stream_content(self, *args, **kwargs):
         yield b""
@@ -190,7 +190,7 @@ async def test_start_forwards_invite_and_allows_immediate_first_topic():
     await harness.message("Следить за открытием станции метро")
     harness.service.prepare_story.assert_awaited_once()
     assert "Что произошло" in harness.text
-    buttons = [button for call in harness.session.calls if isinstance(call, SendMessage) and call.reply_markup
+    buttons = [button for call in harness.session.calls if isinstance(call, (SendMessage, EditMessageText)) and call.reply_markup
                for row in call.reply_markup.inline_keyboard for button in row]
     assert {button.callback_data for button in buttons} >= {"watch:11", "cancel:11"}
 
@@ -281,7 +281,7 @@ async def test_safe_service_error_is_escaped():
     harness.service.request_check.side_effect = UserError("Достигнут лимит <5> проверок")
     await harness.message("/check_now 11")
     assert "&lt;5&gt;" in harness.text
-    harness.service.request_check.assert_awaited_once_with(100, 11)
+    harness.service.request_check.assert_awaited_once_with(100, 11, progress=ANY, on_complete=ANY)
 
 
 @pytest.mark.asyncio

@@ -314,10 +314,10 @@ class Repository:
         async with self._transaction() as session:
             story = await session.scalar(select(Story).where(Story.id == story_id).with_for_update(key_share=True))
             if story is None or story.status != "active" or not lock_token or story.lock_token != lock_token:
-                return
+                return False
             now = utcnow()
             if story.lock_until is None or story.lock_until <= now:
-                return
+                return False
             story.lock_until = story.lock_token = None
             story.next_check_at = completion_next(story, now, error)
             if story.monitoring_mode == "intensive" and story.intensive_until <= now:
@@ -327,6 +327,7 @@ class Repository:
             if not error:
                 story.last_checked_at = now
                 self._event(session, "story_check_completed", story.user_id, story.id)
+            return True
 
     async def known_sources(self, story_id):
         async with self._transaction() as session:

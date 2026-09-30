@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import asyncio
 import logging
 import re
 import time
@@ -17,6 +18,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.domain import UserError
 from app.monitoring import IntensiveSlotOccupied
+from app.telegram_progress import TelegramProgress
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_UNITS = 3900
@@ -292,8 +294,8 @@ class AccessMiddleware(BaseMiddleware):
             return None
 
 
-async def _answer(message: Message, text: str, keyboard: InlineKeyboardMarkup | None = None) -> None:
-    await message.answer(text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
+async def _answer(message: Message, text: str, keyboard: InlineKeyboardMarkup | None = None) -> Message:
+    return await message.answer(text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
 
 
 async def _replace(message: Message, text: str, keyboard: InlineKeyboardMarkup | None = None) -> None:
@@ -318,6 +320,21 @@ def build_router(service: Any, settings: Any) -> Router:
     access = AccessMiddleware(service)
     router.message.outer_middleware(access)
     router.callback_query.outer_middleware(access)
+
+    async def run_manual_check(message, user_id, story_id):
+        sent = await _answer(message, f"⏳ Запускаю проверку темы №{story_id}…")
+        progress = TelegramProgress(sent, "check", story_id)
+        progress.start()
+        try:
+            await service.request_check(user_id, story_id, progress=progress.update, on_complete=progress.complete)
+        except UserError as exc:
+            await progress.finish("⚠️ " + escaped(str(exc), 1800), progress.keyboard())
+        except asyncio.CancelledError:
+            await progress.finish("⏹ Запуск проверки прерван. Откройте тему и попробуйте снова.", progress.keyboard())
+            raise
+        except Exception as exc:
+            logger.error("manual_start_failed error_type=%s", type(exc).__name__)
+            await progress.finish(UNEXPECTED, progress.keyboard())
 
     async def show_list(message: Message, user_id: int, action: str = "story") -> None:
         stories = await service.list_stories(user_id)
@@ -386,8 +403,7 @@ def build_router(service: Any, settings: Any) -> Router:
         if story_id is None:
             await show_list(message, message.from_user.id, "check")
         else:
-            result = await service.request_check(message.from_user.id, story_id)
-            await _answer(message, escaped(result, 1500))
+            await run_manual_check(message, message.from_user.id, story_id)
 
     @router.message(Command("admin"))
     async def admin(message: Message) -> None:
@@ -484,7 +500,7 @@ def build_router(service: Any, settings: Any) -> Router:
             changed = await service.set_monitoring_mode(user_id, object_id, "daily")
             await _replace(message, "✅ В этой теме обычный режим.\n\n" + story_text(changed), story_keyboard(changed))
         elif action == "check":
-            await _answer(message, escaped(await service.request_check(user_id, object_id), 1500))
+            await run_manual_check(message, user_id, object_id)
         elif action in {"pause", "resume"}:
             changed = await service.set_status(user_id, object_id, "paused" if action == "pause" else "active")
             if changed is None:
@@ -519,9 +535,21 @@ def build_router(service: Any, settings: Any) -> Router:
             raise UserError("Текст слишком длинный. Пришлите ссылку или описание до 10 000 символов.")
         if not service.provider_ready():
             raise UserError("Анализ пока недоступен: администратору нужно настроить API-ключ LLM. Попробуйте позже.")
-        await _answer(message, "🔎 Разбираюсь в сюжете и формулирую, за чем следить…")
-        story = await service.prepare_story(message.from_user.id, text)
-        await _answer(message, preview_text(story), preview_keyboard(story))
+        sent = await _answer(message, "⏳ Принимаю новость… Здесь появятся этапы работы и готовая карточка.")
+        progress = TelegramProgress(sent, "prepare")
+        progress.start()
+        try:
+            story = await service.prepare_story(message.from_user.id, text, progress=progress.update)
+        except UserError as exc:
+            await progress.finish("⚠️ " + escaped(str(exc), 1800))
+        except asyncio.CancelledError:
+            await progress.finish("⏹ Подготовка прервана. Пришлите новость ещё раз.")
+            raise
+        except Exception as exc:
+            logger.error("story_prepare_failed error_type=%s", type(exc).__name__)
+            await progress.finish(UNEXPECTED)
+        else:
+            await progress.finish(preview_text(story), preview_keyboard(story))
 
     @router.message()
     async def unsupported(message: Message) -> None:

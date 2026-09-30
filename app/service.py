@@ -15,6 +15,7 @@ from app.domain import Candidate, ProviderUnavailable, UserError
 from app.repository import Repository
 from app.search.client import SearchClient
 from app.search.dedupe import content_hash, is_near_duplicate, normalize_url
+from app.progress import CheckMetrics, CheckOutcome, progress_context, report
 
 log = logging.getLogger(__name__)
 usage_context: ContextVar[dict] = ContextVar('usage_context', default={})
@@ -70,7 +71,17 @@ class BotService:
         if not await self.repo.get_user(user_id):
             raise UserError('Доступ только по приглашению. Откройте вашу пригласительную ссылку.')
 
-    async def prepare_story(self, user_id, text):
+    async def prepare_story(self, user_id, text, progress=None):
+        token = progress_context.set(progress)
+        try:
+            async with asyncio.timeout(300):
+                return await self._prepare_story(user_id, text)
+        except TimeoutError:
+            raise UserError('Подготовка заняла слишком много времени. Пришлите ссылку или описание ещё раз.') from None
+        finally:
+            progress_context.reset(token)
+
+    async def _prepare_story(self, user_id, text):
         await self._require_user(user_id)
         if not self.provider_ready():
             raise ProviderUnavailable('Анализ пока не настроен. Администратору нужно подключить ключ нейросети.')
@@ -89,6 +100,7 @@ class BotService:
                 url = urls[0].rstrip('.,;)')
                 # Fetch performs DNS-pinned URL and redirect validation.
                 try:
+                    await report('reading_input')
                     page = await self.fetcher.fetch(url)
                     if len(page.text.strip()) < 80:
                         raise ValueError('not enough readable source content')
@@ -97,8 +109,10 @@ class BotService:
                     raise UserError('Не удалось безопасно прочитать эту страницу. Пришлите текст новости или кратко опишите сюжет.') from None
             else:
                 text_for_ai = text
+            await report('extracting')
             extraction = await self.ai.extract(text_for_ai, url=url)
             extraction.search_queries = extraction.search_queries[:self.settings.max_search_queries_per_story]
+            await report('saving_draft')
             story = await self.repo.create_draft(user_id, text, url, extraction)
             await self.repo.record_usage('story_draft', user_id=user_id, story_id=story.id)
             return story
@@ -133,7 +147,7 @@ class BotService:
             raise UserError('Неизвестное действие.')
         return await self.repo.set_status(user_id, story_id, status)
 
-    async def request_check(self, user_id, story_id):
+    async def request_check(self, user_id, story_id, progress=None, on_complete=None):
         await self._require_user(user_id)
         if not self.provider_ready():
             raise ProviderUnavailable('Анализ пока не настроен. Нужен ключ нейросети.')
@@ -143,12 +157,29 @@ class BotService:
             story = await self.repo.claim_story(story_id, user_id=user_id, manual=True)
             if not story:
                 raise UserError('Наблюдение уже проверяется, приостановлено или недоступно.')
-            task = asyncio.create_task(self.check_story(story), name=f'check-{story.id}')
+            task = asyncio.create_task(self._manual_check(story, progress, on_complete), name=f'check-{story.id}')
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
-        return 'Проверка запущена. Пришлю сообщение, только если появилось существенное развитие.'
+        return 'Проверка запущена. Покажу этапы работы и результат в этом сообщении.'
 
-    async def _candidates(self, story):
+    async def _manual_check(self, story, progress, on_complete):
+        outcome = CheckOutcome('error', message='Не удалось завершить проверку. Попробуйте позже.')
+        try:
+            outcome = await self.check_story(story, progress=progress) if progress else await self.check_story(story)
+        except asyncio.CancelledError:
+            outcome = CheckOutcome('cancelled', message='Проверка прервана перезапуском бота. Автоматическое наблюдение продолжится.')
+            raise
+        except Exception as exc:
+            await self._error('manual_check', exc, story_id=story.id, user_id=story.user_id)
+        finally:
+            if on_complete is not None:
+                try:
+                    async with asyncio.timeout(15):
+                        await on_complete(outcome)
+                except Exception as exc:
+                    await self._error('check_status', exc, story_id=story.id, user_id=story.user_id)
+
+    async def _candidates(self, story, metrics=None):
         known = await self.repo.known_sources(story.id)
         known_urls = await self.repo.known_url_set(story.id)
         if story.original_url:
@@ -157,17 +188,22 @@ class BotService:
         excerpts = [source.content_excerpt for source in known if source.content_excerpt]
         results = []
         successful_queries = 0
-        for query in story.search_queries[:self.settings.max_search_queries_per_story]:
+        queries = story.search_queries[:self.settings.max_search_queries_per_story]
+        for number, query in enumerate(queries, 1):
+            await report('searching', current=number, total=len(queries), results=len(results))
             try:
                 results.extend(await self.search.search(query))
                 successful_queries += 1
             except Exception as exc:
+                if metrics is not None:
+                    metrics.queries_failed += 1
                 await self._error('search', exc, story_id=story.id, user_id=story.user_id)
         if not successful_queries:
             raise ProviderUnavailable('Поиск временно недоступен.')
         candidates = []
+        attempted = 0
         for result in results:
-            if len(candidates) >= self.settings.max_sources_per_check:
+            if len(candidates) >= max(1, min(6, self.settings.max_sources_per_check)):
                 break
             try:
                 normalized = normalize_url(result.url)
@@ -184,6 +220,8 @@ class BotService:
                 continue
             body = result.snippet
             title = result.title
+            attempted += 1
+            await report('reading_sources', current=attempted, results=len(results))
             try:
                 page = await self.fetcher.fetch(result.url)
                 # Google News RSS links often lead to a JS-only shell. In that case
@@ -207,16 +245,22 @@ class BotService:
             await self.repo.record_usage('source_new', story_id=story.id, user_id=story.user_id)
         return candidates
 
-    async def check_story(self, story):
+    async def check_story(self, story, progress=None):
         started = time.monotonic()
         ctx = usage_context.set({'user_id': story.user_id, 'story_id': story.id})
+        progress_token = progress_context.set(progress)
+        metrics = CheckMetrics()
+        candidates = []
+        outcome = CheckOutcome('error', message='Не удалось завершить проверку. Попробуйте позже.')
         failed = False
         try:
+            await report('queued')
             async with self._checks:
                 async with asyncio.timeout(600):
-                    candidates = await self._candidates(story)
+                    candidates = await self._candidates(story, metrics=metrics)
                     analysis = None
                     if candidates:
+                        await report('analyzing', sources=len(candidates))
                         context = {key: getattr(story, key) for key in ['title','current_state','watch_goals','entities','keywords']}
                         context['monitoring_started_at'] = utc(story.created_at).isoformat()
                         context['now'] = datetime.now(timezone.utc).isoformat()
@@ -229,7 +273,10 @@ class BotService:
                             and analysis.novelty_score >= .65 and analysis.importance_score >= .55
                             and analysis.confidence >= .75 and analysis.new_facts and analysis.source_urls
                             and analysis.notification_summary and analysis.updated_state)
+                    await report('saving_result', sources=len(candidates))
                     update = await self.repo.save_check(story.id, story.lock_token, candidates, analysis)
+                    outcome = CheckOutcome('changed' if update else ('unchanged' if candidates else 'no_sources'),
+                                           sources=len(candidates), partial_search=bool(metrics.queries_failed))
                     await self.repo.record_usage('check', user_id=story.user_id, story_id=story.id,
                         detail=f'sources={len(candidates)}; update={bool(update)}; seconds={time.monotonic()-started:.1f}')
         except asyncio.CancelledError:
@@ -237,14 +284,23 @@ class BotService:
             raise
         except Exception as exc:
             failed = True
+            reason = str(exc) if isinstance(exc, UserError) else (
+                'Проверка заняла слишком много времени.' if isinstance(exc, TimeoutError)
+                else 'Не удалось завершить проверку из-за временного сбоя.')
+            outcome = CheckOutcome('error', sources=len(candidates), message=reason)
             await self._error('check', exc, story_id=story.id, user_id=story.user_id)
         finally:
             try:
-                await self.repo.finish_check(story.id, story.lock_token, error=failed)
+                saved = await self.repo.finish_check(story.id, story.lock_token, error=failed)
+                if saved is False:
+                    outcome = CheckOutcome('cancelled', message='Эта проверка больше не актуальна: наблюдение было изменено или остановлено. Текущее состояние — в карточке темы.')
             except Exception as exc:
+                outcome = CheckOutcome('error', message='Не удалось сохранить завершение проверки. Посмотрите текущее состояние темы.')
                 await self._error('finish_check', exc, story_id=story.id, user_id=story.user_id)
             finally:
                 usage_context.reset(ctx)
+                progress_context.reset(progress_token)
+        return outcome
 
     async def _error(self, operation, exc, **context):
         # Exception strings may contain a request URL, headers or user content.
