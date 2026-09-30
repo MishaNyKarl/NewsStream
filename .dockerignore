@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+__pycache__
+.pytest_cache
+.ruff_cache
+*.egg-info
+.venv
+backups
+private-access*
