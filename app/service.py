@@ -71,17 +71,17 @@ class BotService:
         if not await self.repo.get_user(user_id):
             raise UserError('Доступ только по приглашению. Откройте вашу пригласительную ссылку.')
 
-    async def prepare_story(self, user_id, text, progress=None):
+    async def prepare_story(self, user_id, text, progress=None, *, source_url=None, use_text=False):
         token = progress_context.set(progress)
         try:
             async with asyncio.timeout(300):
-                return await self._prepare_story(user_id, text)
+                return await self._prepare_story(user_id, text, source_url=source_url, use_text=use_text)
         except TimeoutError:
             raise UserError('Подготовка заняла слишком много времени. Пришлите ссылку или описание ещё раз.') from None
         finally:
             progress_context.reset(token)
 
-    async def _prepare_story(self, user_id, text):
+    async def _prepare_story(self, user_id, text, *, source_url=None, use_text=False):
         await self._require_user(user_id)
         if not self.provider_ready():
             raise ProviderUnavailable('Анализ пока не настроен. Администратору нужно подключить ключ нейросети.')
@@ -94,9 +94,13 @@ class BotService:
         ctx = usage_context.set({'user_id': user_id})
         try:
             await self.repo.record_usage('story_input_received', user_id=user_id)
-            url = None
+            # Only public forwarded-post references are accepted as provenance.
+            # They are never fetched when the actual post text is provided.
+            url = source_url if source_url and re.fullmatch(r'https://t\.me/[A-Za-z0-9_]{1,64}/[1-9][0-9]*', source_url) else None
             urls = re.findall(r'https?://[^\s<>]+', text)
-            if urls:
+            if use_text and len(re.sub(r'https?://[^\s<>]+', '', text).strip()) < 10:
+                raise UserError('В посте почти нет текста новости. Перешлите пост с описанием события или отправьте ссылку на статью отдельным сообщением.')
+            if urls and not use_text:
                 url = urls[0].rstrip('.,;)')
                 # Fetch performs DNS-pinned URL and redirect validation.
                 try:

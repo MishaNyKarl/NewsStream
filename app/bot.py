@@ -19,6 +19,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.domain import UserError
 from app.monitoring import IntensiveSlotOccupied
 from app.telegram_progress import TelegramProgress
+from app.telegram_input import AlbumMiddleware, extract_story_input
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_UNITS = 3900
@@ -157,9 +158,13 @@ def preview_text(story: Any) -> str:
 
 
 def preview_keyboard(story: Any) -> InlineKeyboardMarkup:
-    return _keyboard([_button("✅ Следить", "watch", story.id)],
-                     [_button("⚡ Следить внимательнее", "focus", story.id)],
-                     [_button("❌ Отмена", "cancel", story.id)])
+    rows = [[_button("✅ Следить", "watch", story.id)],
+            [_button("⚡ Следить внимательнее", "focus", story.id)],
+            [_button("❌ Отмена", "cancel", story.id)]]
+    source = safe_url(getattr(story, 'original_url', None))
+    if source:
+        rows.append([InlineKeyboardButton(text="↗ Исходная новость", url=source)])
+    return _keyboard(*rows)
 
 
 def story_text(story: Any) -> str:
@@ -202,6 +207,9 @@ def story_keyboard(story: Any) -> InlineKeyboardMarkup:
         [_button("🕒 История", "history", story.id), _button("💬 Обсудить", "chat", story.id)],
         [_button("🗑 Удалить", "delete", story.id), _button("📋 Все наблюдения", "list", 0)],
     ])
+    source = safe_url(getattr(story, 'original_url', None))
+    if source:
+        rows.append([InlineKeyboardButton(text="↗ Исходная новость", url=source)])
     return _keyboard(*rows)
 
 
@@ -257,7 +265,7 @@ class AccessMiddleware(BaseMiddleware):
         user = event.from_user
         if user is None or user.is_bot:
             return None
-        start_arg = _start_argument(event) if isinstance(event, Message) else None
+        start_arg = _start_argument(event) if isinstance(event, Message) and event.forward_origin is None else None
         try:
             admitted = await self.service.authorize(
                 user.id, username=user.username, first_name=user.first_name, start_arg=start_arg or "",
@@ -318,6 +326,7 @@ def _command_id(command: CommandObject) -> int | None:
 def build_router(service: Any, settings: Any) -> Router:
     router = Router(name="news_watch")
     access = AccessMiddleware(service)
+    router.message.outer_middleware(AlbumMiddleware())
     router.message.outer_middleware(access)
     router.callback_query.outer_middleware(access)
 
@@ -357,22 +366,22 @@ def build_router(service: Any, settings: Any) -> Router:
             f"Сейчас: №{focused.id}. Режим можно перенести в карточке другой темы." if focused else "Сейчас место свободно."))
         await _answer(message, "\n".join(lines), _keyboard(*rows))
 
-    @router.message(CommandStart())
+    @router.message(CommandStart(), ~F.forward_origin)
     async def start(message: Message) -> None:
         ready = "" if service.provider_ready() else "\n\n⚙️ Анализ временно недоступен: администратору нужно настроить API-ключ LLM."
         await _answer(message,
             "📰 <b>Следите за развитием истории</b>\n\n"
-            "Пришлите ссылку на новость или напишите, за чем следить. Я покажу, что понял, и попрошу подтвердить наблюдение.\n\n"
+            "Пришлите ссылку, перешлите пост из канала или напишите, за чем следить. Посты с фото/видео принимаю по тексту подписи. Я покажу, что понял, и попрошу подтвердить наблюдение.\n\n"
             f"Проверяю каждые {int(settings.default_check_interval_hours)} ч. Уведомляю, когда появляются существенные новые сведения. Пересказы стараюсь пропускать.\n\n"
             + INTENSIVE_HELP + "\n\n"
             "Например: «Когда откроют новую станцию метро и изменились ли сроки?»\n\n"
             "Ваши сюжеты — /watching · Как пользоваться — /help" + ready)
 
-    @router.message(Command("help"))
+    @router.message(Command("help"), ~F.forward_origin)
     async def help_command(message: Message) -> None:
         await _answer(message,
             "<b>Как пользоваться</b>\n\n"
-            "1. Пришлите ссылку, текст новости или описание сюжета.\n"
+            "1. Пришлите ссылку, текст новости или перешлите пост из канала — с текстом либо подписью к фото/видео. Альбом принимаю как одну новость.\n"
             "2. Проверьте карточку и нажмите «Следить».\n"
             "3. Получайте уведомления о развитии истории и отмечайте, были ли они полезны.\n\n"
             f"Автоматическая проверка — каждые {int(settings.default_check_interval_hours)} ч. "
@@ -389,15 +398,15 @@ def build_router(service: Any, settings: Any) -> Router:
             "Поиск может пропускать публикации, а ИИ — ошибаться. Сверяйте важные выводы с источниками. "
             "Не отправляйте пароли и личные документы. Удаление наблюдения удаляет его сохранённые тексты и историю.")
 
-    @router.message(Command("watching"))
+    @router.message(Command("watching"), ~F.forward_origin)
     async def watching(message: Message) -> None:
         await show_list(message, message.from_user.id)
 
-    @router.message(Command("cancel"))
+    @router.message(Command("cancel"), ~F.forward_origin)
     async def cancel(message: Message) -> None:
         await _answer(message, "Чтобы отменить создание, нажмите «Отмена» под карточкой предпросмотра. Неподтверждённый сюжет не отслеживается. Можно сразу прислать другую тему.")
 
-    @router.message(Command("check_now"))
+    @router.message(Command("check_now"), ~F.forward_origin)
     async def check_now(message: Message, command: CommandObject) -> None:
         story_id = _command_id(command)
         if story_id is None:
@@ -405,7 +414,7 @@ def build_router(service: Any, settings: Any) -> Router:
         else:
             await run_manual_check(message, message.from_user.id, story_id)
 
-    @router.message(Command("admin"))
+    @router.message(Command("admin"), ~F.forward_origin)
     async def admin(message: Message) -> None:
         user_id = message.from_user.id
         if not await service.is_admin(user_id):
@@ -421,14 +430,14 @@ def build_router(service: Any, settings: Any) -> Router:
         text += "\n\n/admin_errors — последние ошибки\n/demo_update — тестовое уведомление (если включён demo mode)"
         await _answer(message, text)
 
-    @router.message(Command("admin_errors"))
+    @router.message(Command("admin_errors"), ~F.forward_origin)
     async def admin_errors(message: Message) -> None:
         if not await service.is_admin(message.from_user.id):
             raise UserError("Эта команда доступна только администратору.")
         errors = await service.admin_errors(message.from_user.id)
         await _answer(message, "🛠 <b>Последние ошибки</b>\n\n" + escaped(errors, 3300))
 
-    @router.message(Command("demo_update"))
+    @router.message(Command("demo_update"), ~F.forward_origin)
     async def demo_update(message: Message, command: CommandObject) -> None:
         if not await service.is_admin(message.from_user.id):
             raise UserError("Эта команда доступна только администратору.")
@@ -522,13 +531,14 @@ def build_router(service: Any, settings: Any) -> Router:
                 for update in updates[:5]:
                     await _answer(message, _date(update.created_at) + "\n\n" + notification_text(story, update), notification_keyboard(story, update))
 
-    @router.message(F.text.startswith("/"))
+    @router.message(F.text.startswith("/"), ~F.forward_origin)
     async def unknown_command(message: Message) -> None:
         await _answer(message, "Не знаю эту команду. /help — подсказка, /watching — ваши наблюдения. Для нового сюжета просто пришлите ссылку или текст.")
 
-    @router.message(F.text)
-    async def new_story(message: Message) -> None:
-        text = (message.text or "").strip()
+    @router.message(F.text | F.caption)
+    async def new_story(message: Message, album_messages: list[Message] | None = None) -> None:
+        seed = extract_story_input(message, album_messages)
+        text = seed.text
         if len(text) < 10:
             raise UserError("Добавьте немного подробностей: что произошло и какое развитие вас интересует?")
         if len(text) > 10000:
@@ -539,7 +549,8 @@ def build_router(service: Any, settings: Any) -> Router:
         progress = TelegramProgress(sent, "prepare")
         progress.start()
         try:
-            story = await service.prepare_story(message.from_user.id, text, progress=progress.update)
+            options = {'source_url': seed.source_url, 'use_text': True} if seed.use_text else {}
+            story = await service.prepare_story(message.from_user.id, text, progress=progress.update, **options)
         except UserError as exc:
             await progress.finish("⚠️ " + escaped(str(exc), 1800))
         except asyncio.CancelledError:
@@ -553,6 +564,6 @@ def build_router(service: Any, settings: Any) -> Router:
 
     @router.message()
     async def unsupported(message: Message) -> None:
-        await _answer(message, "Пока я принимаю текст и ссылки. Пришлите ссылку на новость или опишите сюжет несколькими словами.")
+        await _answer(message, "В этом сообщении нет текста новости. Перешлите пост с текстом или подписью к фото/видео либо кратко опишите событие. Содержимое самих фото, видео и голосовых пока не распознаю.")
 
     return router

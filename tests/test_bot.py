@@ -79,10 +79,10 @@ class Harness:
         self.dispatcher.include_router(self.router)
         self.counter = 1
 
-    async def message(self, text, chat_type="private"):
+    async def message(self, text=None, chat_type="private", **fields):
         message = Message(message_id=self.counter, date=NOW,
                           chat=Chat(id=100, type=chat_type),
-                          from_user=User(id=100, is_bot=False, first_name="Tester"), text=text)
+                          from_user=User(id=100, is_bot=False, first_name="Tester"), text=text, **fields)
         update = Update(update_id=self.counter, message=message)
         self.counter += 1
         await self.dispatcher.feed_update(self.bot, update)
