@@ -18,7 +18,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.domain import UserError
 from app.monitoring import IntensiveSlotOccupied
-from app.telegram_progress import TelegramProgress
+from app.telegram_progress import ProgressEditBudget, TelegramProgress
 from app.telegram_input import AlbumMiddleware, extract_story_input
 
 logger = logging.getLogger(__name__)
@@ -353,6 +353,7 @@ def _command_id(command: CommandObject) -> int | None:
 
 
 def build_router(service: Any, settings: Any) -> Router:
+    progress_budget = ProgressEditBudget()
     router = Router(name="news_watch")
     access = AccessMiddleware(service)
     router.message.outer_middleware(AlbumMiddleware())
@@ -360,7 +361,7 @@ def build_router(service: Any, settings: Any) -> Router:
     router.callback_query.outer_middleware(access)
 
     async def run_manual_check(message, user_id, story_id):
-        progress = await TelegramProgress.begin(message, "check", story_id)
+        progress = await TelegramProgress.begin(message, "check", story_id, budget=progress_budget)
         try:
             await service.request_check(user_id, story_id, progress=progress.update, on_complete=progress.complete)
         except UserError as exc:
@@ -631,7 +632,7 @@ def build_router(service: Any, settings: Any) -> Router:
             raise UserError("Текст слишком длинный. Пришлите ссылку или описание до 10 000 символов.")
         if not service.provider_ready():
             raise UserError("Анализ пока недоступен: администратору нужно настроить API-ключ LLM. Попробуйте позже.")
-        progress = await TelegramProgress.begin(message, "prepare")
+        progress = await TelegramProgress.begin(message, "prepare", budget=progress_budget)
         try:
             options = {'source_url': seed.source_url, 'use_text': True} if seed.use_text else {}
             story = await service.prepare_story(message.from_user.id, text, progress=progress.update, **options)

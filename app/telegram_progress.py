@@ -12,10 +12,38 @@ from app.progress import ProgressEvent
 
 log = logging.getLogger(__name__)
 EDIT_TIMEOUT = 4
+ERROR_RETRY_SECONDS = 5
 # Keep terminal retries alive without occupying analysis slots. They only edit
 # an existing message, expire after two minutes and never trigger another check.
 _terminal_tasks: set[asyncio.Task] = set()
 MSK = timezone(timedelta(hours=3))
+
+
+class ProgressEditBudget:
+    """Shared by a router: at most one progress edit/chat/s and ten overall/s.
+
+    Admission has no await, so concurrent tasks on the bot loop cannot reserve
+    the same slot. Intermediate ticks are coalesced, never queued for replay.
+    This budget covers progress edits only, leaving room for other bot traffic.
+    """
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.next_global = 0
+        self.blocked_until = 0
+        self.chats = {}
+
+    def retry_delay(self, chat_id):
+        now = self.clock()
+        delay = max(self.next_global, self.blocked_until, self.chats.get(chat_id, 0)) - now
+        if delay > 0:
+            return delay
+        self.chats = {key: due for key, due in self.chats.items() if due > now}
+        self.chats[chat_id] = now + 1
+        self.next_global = now + 0.1
+        return 0
+
+    def pause(self, seconds):
+        self.blocked_until = max(self.blocked_until, self.clock() + seconds)
 
 
 def stage_index(operation, event):
@@ -149,7 +177,7 @@ def outcome_text(outcome, elapsed=None):
 
 class TelegramProgress:
     def __init__(self, message, operation, story_id=None, clock=time.monotonic,
-                 refresh_seconds=10, min_edit_seconds=2, started_at=None):
+                 refresh_seconds=1, min_edit_seconds=1, started_at=None, budget=None):
         self.message = message
         self.operation = operation
         self.story_id = story_id
@@ -160,6 +188,8 @@ class TelegramProgress:
         self.visited = {0} if operation == "prepare" else set()
         self.refresh_seconds = refresh_seconds
         self.min_edit_seconds = min_edit_seconds
+        self.budget = budget
+        self._chat_id = getattr(getattr(message, 'chat', None), 'id', None)
         self._wake = asyncio.Event()
         self._task = None
         self._closed = False
@@ -169,8 +199,8 @@ class TelegramProgress:
         self._terminal_task = None
 
     @classmethod
-    async def begin(cls, message, operation, story_id=None):
-        display = cls(message, operation, story_id)
+    async def begin(cls, message, operation, story_id=None, *, budget=None):
+        display = cls(message, operation, story_id, budget=budget)
         text = progress_text(operation, story_id, display.event, 0, 0,
                              started_at=display.started_at, visited=display.visited)
         # When a button belongs to a reply card, preserve the original user's
@@ -210,7 +240,12 @@ class TelegramProgress:
 
     async def _edit(self, text, keyboard=None):
         if self._unavailable or text == self._last_text:
-            return
+            return False
+        if self.budget is not None:
+            delay = self.budget.retry_delay(self._chat_id)
+            if delay > 0:
+                self._retry_at = max(self._retry_at, self.clock() + delay)
+                return False
         try:
             # Message shortcuts pass extra keywords into the API body; they do
             # not accept Bot's request_timeout argument. Bound the await itself.
@@ -220,6 +255,12 @@ class TelegramProgress:
             self._last_text = text
         except TelegramRetryAfter as exc:
             self._retry_at = self.clock() + exc.retry_after
+            # Keep this operation slow after a flood response, even when stages
+            # change rapidly. Other live timers also respect the requested pause.
+            self.refresh_seconds = max(self.refresh_seconds, 5)
+            self.min_edit_seconds = max(self.min_edit_seconds, 5)
+            if self.budget is not None:
+                self.budget.pause(exc.retry_after)
         except TelegramForbiddenError:
             self._unavailable = True
         except TelegramBadRequest as exc:
@@ -228,46 +269,58 @@ class TelegramProgress:
             else:
                 self._unavailable = True
         except Exception as exc:
-            self._retry_at = self.clock() + self.refresh_seconds
+            self._retry_at = self.clock() + max(ERROR_RETRY_SECONDS, self.refresh_seconds)
             log.warning("progress_edit_failed error_type=%s", type(exc).__name__)
+        return True
 
     async def _deliver_terminal(self, text, keyboard):
         try:
             async with asyncio.timeout(120):
-                for _ in range(5):
+                attempts = 0
+                while attempts < 5:
                     if self._unavailable or self._last_text == text:
                         return
                     delay = self._retry_at - self.clock()
                     if delay > 0:
                         await asyncio.sleep(delay)
-                    await self._edit(text, keyboard)
+                    # Waiting for a shared slot is not a failed delivery attempt.
+                    attempts += bool(await self._edit(text, keyboard))
         except TimeoutError:
             log.warning("terminal_progress_delivery_expired")
 
     async def _run(self):
-        next_edit = self.clock() + self.min_edit_seconds
+        loop = asyncio.get_running_loop()
+        next_edit = loop.time() + self.min_edit_seconds
+        next_tick = loop.time() + self.refresh_seconds
         while not self._closed:
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout=self.refresh_seconds)
+                await asyncio.wait_for(self._wake.wait(), timeout=max(0, next_tick - loop.time()))
             except TimeoutError:
                 pass
             self._wake.clear()
-            delay = max(next_edit, self._retry_at) - self.clock()
+            delay = max(next_edit - loop.time(), self._retry_at - self.clock())
             if delay > 0:
                 # A terminal result wakes this wait immediately.
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=delay)
                 except TimeoutError:
                     pass
-                if not self._closed and self.clock() < max(next_edit, self._retry_at):
+                if not self._closed and (loop.time() < next_edit or self.clock() < self._retry_at):
                     continue
             if self._closed or self._unavailable:
                 return
             text = progress_text(self.operation, self.story_id, self.event,
                                  self.clock() - self.started, self.clock() - self.stage_started,
                                  started_at=self.started_at, visited=self.visited)
-            await self._edit(text, self.keyboard())
-            next_edit = self.clock() + self.min_edit_seconds
+            attempt_started = loop.time()
+            if await self._edit(text, self.keyboard()):
+                next_edit = attempt_started + self.min_edit_seconds
+                next_tick = attempt_started + self.refresh_seconds
+            else:
+                # A busy shared slot is not an edit. Try when it opens instead
+                # of synchronizing all waiting timers onto another full second.
+                retry_delay = self._retry_at - self.clock()
+                next_tick = loop.time() + (retry_delay if retry_delay > 0 else self.refresh_seconds)
 
     async def finish(self, text, keyboard=None, *, status="completed"):
         if self._closed:

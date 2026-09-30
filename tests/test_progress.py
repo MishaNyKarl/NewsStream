@@ -268,7 +268,8 @@ async def test_real_elapsed_updates_while_same_operation_waits_then_stops():
     assert display._task.done()
 
 
-async def test_terminal_result_retries_transient_failure_without_new_message():
+async def test_terminal_result_retries_transient_failure_without_new_message(monkeypatch):
+    monkeypatch.setattr('app.telegram_progress.ERROR_RETRY_SECONDS', 0.01)
     message = SimpleNamespace(edit_text=AsyncMock(side_effect=[OSError('secret-url'), True]))
     display = TelegramProgress(message, 'check', 11, refresh_seconds=0.01)
     display.start()
