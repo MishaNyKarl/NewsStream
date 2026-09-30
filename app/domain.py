@@ -53,5 +53,12 @@ class Candidate:
 class UserError(Exception):
     pass
 
+
+@dataclass
+class InterestSaveResult:
+    interest: object
+    created: bool
+    monitoring_status: str
+
 class ProviderUnavailable(UserError):
     pass

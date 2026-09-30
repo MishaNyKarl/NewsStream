@@ -11,6 +11,8 @@ exclusive FOR UPDATE lock would deadlock user/story or story/outbox mutations
 against those usage inserts despite the application not changing any key.
 """
 import asyncio
+import hashlib
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from uuid import uuid4
@@ -18,8 +20,8 @@ from weakref import WeakKeyDictionary
 
 from sqlalchemy import delete, func, or_, select, text, update
 
-from app.domain import Analysis, Candidate, StoryExtraction, UserError
-from app.models import Feedback, Source, Story, StoryUpdate, UsageEvent, User, utcnow
+from app.domain import Analysis, Candidate, InterestSaveResult, StoryExtraction, UserError
+from app.models import Feedback, Source, Story, StoryUpdate, UsageEvent, User, UserInterest, utcnow
 from app.monitoring import INTENSIVE_DURATION, IntensiveSlotOccupied, completion_next, next_checkpoint
 
 _sqlite_locks = WeakKeyDictionary()
@@ -140,6 +142,58 @@ class Repository:
     async def get_user(self, user_id):
         async with self._transaction() as session:
             return await session.get(User, user_id)
+
+    async def save_interest(self, user_id, story_id):
+        async with self._transaction() as session:
+            # Serialize save/remove and duplicate taps across bot/API processes.
+            user = await session.scalar(select(User).where(User.telegram_id == user_id).with_for_update(key_share=True))
+            if user is None:
+                raise UserError("Сначала откройте доступ через /start.")
+            story = await session.scalar(select(Story).where(Story.id == story_id,
+                Story.user_id == user_id).with_for_update(key_share=True))
+            if story is None:
+                raise UserError("Тема недоступна. Пришлите новость или текст заново.")
+            existing = await session.scalar(select(UserInterest).where(
+                UserInterest.user_id == user_id, UserInterest.source_story_id == story_id))
+            if existing is not None:
+                return InterestSaveResult(existing, False, story.status)
+            if story.status == "deleted":
+                raise UserError("Тема больше недоступна. Пришлите новость или текст заново.")
+            normalized = " ".join(unicodedata.normalize("NFKC", story.original_input).casefold().split())
+            interest = UserInterest(user_id=user_id, source_story_id=story.id, title=story.title,
+                summary=story.summary, entities=list(story.entities), keywords=list(story.keywords),
+                source_url=story.original_url, input_fingerprint=hashlib.sha256(normalized.encode()).hexdigest())
+            session.add(interest)
+            await session.flush()
+            if story.status == "draft":
+                # The explicit interest replaces this unconfirmed draft, so it
+                # does not occupy the story quota or enter the worker schedule.
+                await self._redact(session, story)
+            self._event(session, "interest_saved", user_id=user_id)
+            return InterestSaveResult(interest, True, story.status)
+
+    async def list_interests(self, user_id, before_id=0, limit=9):
+        async with self._transaction() as session:
+            query = select(UserInterest).where(UserInterest.user_id == user_id)
+            if before_id:
+                query = query.where(UserInterest.id < before_id)
+            return list((await session.scalars(query.order_by(UserInterest.id.desc()).limit(limit))).all())
+
+    async def get_interest(self, user_id, interest_id):
+        async with self._transaction() as session:
+            return await session.scalar(select(UserInterest).where(
+                UserInterest.id == interest_id, UserInterest.user_id == user_id))
+
+    async def remove_interest(self, user_id, interest_id):
+        async with self._transaction() as session:
+            await session.scalar(select(User).where(User.telegram_id == user_id).with_for_update(key_share=True))
+            interest = await session.scalar(select(UserInterest).where(
+                UserInterest.id == interest_id, UserInterest.user_id == user_id).with_for_update(key_share=True))
+            if interest is None:
+                return False
+            await session.delete(interest)
+            self._event(session, "interest_removed", user_id=user_id)
+            return True
 
     async def _admit(self, user_id, username, first_name, is_admin, claim):
         async with self._transaction() as session:

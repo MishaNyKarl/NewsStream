@@ -35,16 +35,17 @@ async def main(role='bot'):
             await run_worker(service, bot)
         else:
             try:
-                await bot.set_my_name(name='Развитие новостей', request_timeout=15)
-                await bot.set_my_description(description='Пришлите новость, ссылку или тему — бот будет следить за развитием этой истории и сообщать о существенных изменениях. Закрытый тест: вход по приглашению.', request_timeout=15)
-                await bot.set_my_short_description(short_description='Наблюдение за развитием конкретных историй. Существенные обновления и ссылки на источники.', request_timeout=15)
                 await bot.set_my_commands([
                     BotCommand(command='start', description='Как работает бот'),
                     BotCommand(command='watching', description='Мои наблюдения'),
+                    BotCommand(command='interests', description='Мои интересы'),
                     BotCommand(command='check_now', description='Проверить сюжет'),
                     BotCommand(command='help', description='Помощь'),
                     BotCommand(command='admin', description='Управление тестом'),
                 ], request_timeout=15)
+                await bot.set_my_name(name='Развитие новостей', request_timeout=15)
+                await bot.set_my_description(description='Пришлите новость, ссылку или тему — бот будет следить за развитием этой истории и сообщать о существенных изменениях. Закрытый тест: вход по приглашению.', request_timeout=15)
+                await bot.set_my_short_description(short_description='Наблюдение за развитием конкретных историй. Существенные обновления и ссылки на источники.', request_timeout=15)
             except TelegramAPIError as exc:
                 logging.getLogger(__name__).warning('Profile setup skipped: %s', type(exc).__name__)
             dp = Dispatcher()

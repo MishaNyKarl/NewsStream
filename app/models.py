@@ -102,6 +102,28 @@ class Source(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
+class UserInterest(Base):
+    """An explicit topic preference, independent of monitoring and usefulness votes."""
+    __tablename__ = "user_interests"
+    __table_args__ = (
+        UniqueConstraint("user_id", "source_story_id", name="uq_interest_user_story"),
+        Index("ix_interests_user_id", "user_id", "id"),
+        {"sqlite_autoincrement": True},
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.telegram_id", ondelete="CASCADE"), nullable=False)
+    source_story_id: Mapped[int | None] = mapped_column(ForeignKey("stories.id", ondelete="SET NULL"))
+    # Snapshot survives deleting the monitored story. Only an explicit removal
+    # from the interests list deletes this preference and its topic description.
+    title: Mapped[str] = mapped_column(String(160))
+    summary: Mapped[str] = mapped_column(Text)
+    entities: Mapped[list] = mapped_column(JSON, default=list)
+    keywords: Mapped[list] = mapped_column(JSON, default=list)
+    source_url: Mapped[str | None] = mapped_column(Text)
+    input_fingerprint: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
 class StoryUpdate(Base):
     __tablename__ = "story_updates"
     __table_args__ = (Index("ix_updates_outbox", "notified_at", "delivery_locked_until"),)

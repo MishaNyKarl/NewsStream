@@ -132,6 +132,18 @@ class BotService:
     async def confirm_story(self, user_id, story_id):
         return await self.repo.activate_story(user_id, story_id)
 
+    async def save_interest(self, user_id, story_id):
+        return await self.repo.save_interest(user_id, story_id)
+
+    async def list_interests(self, user_id, before_id=0):
+        return await self.repo.list_interests(user_id, before_id=before_id)
+
+    async def get_interest(self, user_id, interest_id):
+        return await self.repo.get_interest(user_id, interest_id)
+
+    async def remove_interest(self, user_id, interest_id):
+        return await self.repo.remove_interest(user_id, interest_id)
+
     async def set_monitoring_mode(self, user_id, story_id, mode, replace_story_id=None):
         return await self.repo.set_monitoring_mode(user_id, story_id, mode, replace_story_id)
 

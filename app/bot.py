@@ -140,6 +140,7 @@ def notification_keyboard(story: Any, update: Any) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="↗ Открыть источник", url=sources[0])])
     rows.extend([
         [_button("👍 Полезно", "useful", update.id), _button("👎 Неважно", "not_useful", update.id)],
+        [_button("⭐ Интересна тема", "interest", story.id)],
         [_button("⏸ Пауза", "pause", story.id), _button("🕒 История", "history", story.id)],
         [_button("💬 Обсудить", "chat", story.id)],
     ])
@@ -151,15 +152,16 @@ def preview_text(story: Any) -> str:
         f"📰 <b>{escaped(story.title, 180)}</b>\n\n"
         f"<b>Что произошло</b>\n{escaped(story.summary, 850)}\n\n"
         f"<b>Буду отслеживать</b>\n{_bullets(story.watch_goals, 5, 250)}\n\n"
-        "Проверьте, верно ли я понял сюжет. Выберите режим:\n\n"
+        "Проверьте, верно ли я понял сюжет. Выберите действие:\n\n"
         f"Обычный — первая проверка после подписки, затем каждые {int(story.check_frequency_hours)} ч.\n\n"
-        + INTENSIVE_HELP
+        + INTENSIVE_HELP + "\n\n⭐ «Просто интересна тема» — сохранить интерес без наблюдения."
     )
 
 
 def preview_keyboard(story: Any) -> InlineKeyboardMarkup:
     rows = [[_button("✅ Следить", "watch", story.id)],
             [_button("⚡ Следить внимательнее", "focus", story.id)],
+            [_button("⭐ Просто интересна тема", "interest", story.id)],
             [_button("❌ Отмена", "cancel", story.id)]]
     source = safe_url(getattr(story, 'original_url', None))
     if source:
@@ -204,6 +206,7 @@ def story_keyboard(story: Any) -> InlineKeyboardMarkup:
     elif story.status == "active":
         rows.append([_button("⚡ Следить внимательнее", "focus", story.id)])
     rows.extend([
+        [_button("⭐ Интересна тема", "interest", story.id)],
         [_button("🕒 История", "history", story.id), _button("💬 Обсудить", "chat", story.id)],
         [_button("🗑 Удалить", "delete", story.id), _button("📋 Все наблюдения", "list", 0)],
     ])
@@ -213,16 +216,37 @@ def story_keyboard(story: Any) -> InlineKeyboardMarkup:
     return _keyboard(*rows)
 
 
+def interest_text(interest: Any) -> str:
+    keywords = ", ".join(escaped(value, 70) for value in (interest.keywords or [])[:6])
+    return (
+        f"⭐ <b>{escaped(interest.title, 180)}</b>\n\n"
+        f"{escaped(interest.summary, 700)}\n\n"
+        + (f"О чём: {keywords}\n\n" if keywords else "")
+        + "Тема сохранена в ваших интересах для будущих подборок. Подборки пока не запущены. "
+        "Эта отметка сама не включает наблюдение.\n\n"
+        f"Сохранено: {_date(interest.created_at)}"
+    )
+
+
+def interest_keyboard(interest: Any) -> InlineKeyboardMarkup:
+    rows = [[_button("Убрать из интересов", "interest_remove", interest.id)],
+            [_button("⭐ Мои интересы", "interests", 0)]]
+    source = safe_url(getattr(interest, "source_url", None))
+    if source:
+        rows.append([InlineKeyboardButton(text="↗ Исходная новость", url=source)])
+    return _keyboard(*rows)
+
+
 def parse_callback(value: str | None) -> tuple[str, int] | None:
     match = re.fullmatch(
-        r"(watch|cancel|story|card|focus|daily|check|pause|resume|delete|delete_yes|history|chat|useful|not_useful|list):([0-9]{1,10})",
+        r"(watch|cancel|story|card|focus|daily|check|pause|resume|delete|delete_yes|history|chat|useful|not_useful|list|interest|interests|interest_view|interest_remove):([0-9]{1,10})",
         value or "",
     )
     if not match:
         return None
     action, raw_id = match.groups()
     object_id = int(raw_id)
-    if object_id > 2_147_483_647 or (object_id == 0 and action != "list"):
+    if object_id > 2_147_483_647 or (object_id == 0 and action not in {"list", "interests"}):
         return None
     return action, object_id
 
@@ -347,7 +371,8 @@ def build_router(service: Any, settings: Any) -> Router:
     async def show_list(message: Message, user_id: int, action: str = "story") -> None:
         stories = await service.list_stories(user_id)
         if not stories:
-            await _answer(message, "Наблюдений пока нет. Пришлите ссылку на новость или напишите, за каким сюжетом следить.")
+            await _answer(message, "Наблюдений пока нет. Пришлите ссылку на новость или напишите, за каким сюжетом следить.",
+                          _keyboard([_button("⭐ Мои интересы", "interests", 0)]))
             return
         heading = "Какое наблюдение проверить?" if action == "check" else "📋 <b>Мои наблюдения</b>"
         lines = [heading]
@@ -363,7 +388,24 @@ def build_router(service: Any, settings: Any) -> Router:
         focused = next((item for item in stories if getattr(item, "monitoring_mode", "daily") == "intensive"), None)
         lines.append("\n⚡ В тесте — одна тема с частыми проверками. " + (
             f"Сейчас: №{focused.id}. Режим можно перенести в карточке другой темы." if focused else "Сейчас место свободно."))
+        rows.append([_button("⭐ Мои интересы", "interests", 0)])
         await _answer(message, "\n".join(lines), _keyboard(*rows))
+
+    async def show_interests(message: Message, user_id: int, before_id=0, replace=False):
+        items = await service.list_interests(user_id, before_id=before_id)
+        rows = [[_button(str(item.title).replace("\n", " ")[:48], "interest_view", item.id)] for item in items[:8]]
+        if len(items) > 8:
+            rows.append([_button("Дальше →", "interests", items[7].id)])
+        if before_id:
+            rows.append([_button("К началу", "interests", 0)])
+        rows.append([_button("📋 Мои наблюдения", "list", 0)])
+        text = "⭐ <b>Мои интересы</b>\n\n"
+        if items:
+            text += "Выберите тему, чтобы посмотреть или убрать её. Эти отметки пригодятся для будущих подборок; сейчас подборки не рассылаются."
+        else:
+            text += ("Больше тем нет." if before_id else
+                     "Пока пусто. Пришлите новость или текст и выберите «⭐ Просто интересна тема». Можно также отметить интерес в существующем наблюдении.")
+        await (_replace if replace else _answer)(message, text, _keyboard(*rows))
 
     @router.message(CommandStart(), ~F.forward_origin)
     async def start(message: Message) -> None:
@@ -374,14 +416,16 @@ def build_router(service: Any, settings: Any) -> Router:
             f"Проверяю каждые {int(settings.default_check_interval_hours)} ч. Уведомляю, когда появляются существенные новые сведения. Пересказы стараюсь пропускать.\n\n"
             + INTENSIVE_HELP + "\n\n"
             "Например: «Когда откроют новую станцию метро и изменились ли сроки?»\n\n"
-            "Ваши сюжеты — /watching · Как пользоваться — /help" + ready)
+            "Можно выбрать «⭐ Просто интересна тема» — запомню интерес для будущих подборок без запуска наблюдения.\n\n"
+            "Ваши сюжеты — /watching · Мои интересы — /interests · Помощь — /help" + ready,
+            _keyboard([_button("📋 Мои наблюдения", "list", 0), _button("⭐ Мои интересы", "interests", 0)]))
 
     @router.message(Command("help"), ~F.forward_origin)
     async def help_command(message: Message) -> None:
         await _answer(message,
             "<b>Как пользоваться</b>\n\n"
             "1. Пришлите ссылку, текст новости или перешлите пост из канала — с текстом либо подписью к фото/видео. Альбом принимаю как одну новость.\n"
-            "2. Проверьте карточку и нажмите «Следить».\n"
+            "2. Проверьте карточку и нажмите «Следить» либо «⭐ Просто интересна тема», чтобы только сохранить интерес.\n"
             "3. Получайте уведомления о развитии истории и отмечайте, были ли они полезны.\n\n"
             f"Автоматическая проверка — каждые {int(settings.default_check_interval_hours)} ч. "
             f"До {int(settings.max_stories_per_user)} наблюдений на человека. "
@@ -392,10 +436,16 @@ def build_router(service: Any, settings: Any) -> Router:
             "и тема занимает место до выключения, переноса или окончания режима. "
             "Ручная проверка не откладывает автоматическую. Уведомления приходят только при новых важных фактах.\n\n"
             "/watching — список, история, пауза и удаление\n"
+            "/interests — ваши интересы для будущих подборок; просмотр и удаление\n"
             "/check_now — проверить выбранное наблюдение\n"
             "/cancel — как отменить создание\n\n"
             "Поиск может пропускать публикации, а ИИ — ошибаться. Сверяйте важные выводы с источниками. "
-            "Не отправляйте пароли и личные документы. Удаление наблюдения удаляет его сохранённые тексты и историю.")
+            "Не отправляйте пароли и личные документы. Удаление наблюдения удаляет его сохранённые тексты и историю. "
+            "Отдельно отмеченный интерес сохраняется; убрать его можно в /interests. Подборки пока не запущены.")
+
+    @router.message(Command("interests"), ~F.forward_origin)
+    async def interests_command(message: Message) -> None:
+        await show_interests(message, message.from_user.id)
 
     @router.message(Command("watching"), ~F.forward_origin)
     async def watching(message: Message) -> None:
@@ -453,6 +503,37 @@ def build_router(service: Any, settings: Any) -> Router:
         action, object_id = parsed if parsed else ("focus", transfer[0])
         user_id = query.from_user.id
         message = query.message
+        if action == "interests":
+            await query.answer()
+            await show_interests(message, user_id, before_id=object_id, replace=True)
+            return
+        if action == "interest_view":
+            await query.answer()
+            interest = await service.get_interest(user_id, object_id)
+            if interest is None:
+                raise UserError("Интерес уже удалён или недоступен. Откройте /interests.")
+            await _replace(message, interest_text(interest), interest_keyboard(interest))
+            return
+        if action == "interest_remove":
+            removed = await service.remove_interest(user_id, object_id)
+            if not removed:
+                await query.answer("Уже удалён или недоступен.", show_alert=True)
+                return
+            await query.answer("Интерес убран.")
+            await _replace(message, "Отметка интереса убрана. Ваши наблюдения не изменились.",
+                           _keyboard([_button("⭐ Мои интересы", "interests", 0)]))
+            return
+        if action == "interest":
+            result = await service.save_interest(user_id, object_id)
+            if not result.created and result.monitoring_status in {"active", "paused"}:
+                await query.answer("Уже в ваших интересах. Посмотреть или убрать: /interests.", show_alert=True)
+                return
+            await query.answer("Интерес сохранён." if result.created else "Уже в ваших интересах.")
+            prefix = {"active": "Наблюдение продолжает работать.\n\n",
+                      "paused": "Наблюдение остаётся на паузе.\n\n"}.get(result.monitoring_status, "Наблюдение не включено.\n\n")
+            send = _answer if result.monitoring_status in {"active", "paused"} else _replace
+            await send(message, prefix + interest_text(result.interest), interest_keyboard(result.interest))
+            return
         if action == "focus":
             await query.answer()
             try:
@@ -516,7 +597,8 @@ def build_router(service: Any, settings: Any) -> Router:
             await _answer(message, story_text(changed), story_keyboard(changed))
         elif action == "delete":
             await _answer(message,
-                f"Удалить наблюдение «{escaped(story.title, 200)}»?\n\nЕго тексты, источники и история будут удалены. Это действие нельзя отменить.",
+                f"Удалить наблюдение «{escaped(story.title, 200)}»?\n\nЕго тексты, источники и история будут удалены. Это действие нельзя отменить. "
+                "Отдельно отмеченный интерес останется в /interests; там его можно убрать.",
                 _keyboard([_button("🗑 Да, удалить", "delete_yes", object_id), _button("Оставить", "story", object_id)]))
         elif action == "delete_yes":
             await service.set_status(user_id, object_id, "deleted")
