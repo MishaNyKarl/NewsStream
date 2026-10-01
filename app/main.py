@@ -37,6 +37,8 @@ async def main(role='bot'):
             try:
                 await bot.set_my_commands([
                     BotCommand(command='start', description='Как работает бот'),
+                    BotCommand(command='menu', description='Главное меню'),
+                    BotCommand(command='news', description='Новости пользователя'),
                     BotCommand(command='watching', description='Мои наблюдения'),
                     BotCommand(command='journal', description='Журнал уведомлений'),
                     BotCommand(command='interests', description='Мои интересы'),

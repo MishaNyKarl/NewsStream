@@ -14,10 +14,12 @@ from urllib.parse import urlsplit
 from aiogram import BaseMiddleware, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters
+from aiogram.types import BufferedInputFile, CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters
 
 from app.domain import UserError
 from app.monitoring import IntensiveSlotOccupied
+from app.navigation import main_keyboard, safe_url, with_home
+from app import user_news
 from app.journal import DATE_HELP, DATE_PROMPT, PAGE_SIZE, date_window, parse_journal_callback, preset_window
 from app.telegram_progress import ProgressEditBudget, TelegramProgress
 from app.telegram_input import AlbumMiddleware, extract_story_input
@@ -52,26 +54,6 @@ def escaped(value: Any, limit: int = 700) -> str:
         used += size
     return "".join(parts)
 
-
-def safe_url(value: Any) -> str | None:
-    """Accept complete web URLs only; never truncate an href."""
-    if not isinstance(value, str) or not value or len(value) > 1500:
-        return None
-    if any(char.isspace() or ord(char) < 32 for char in value):
-        return None
-    try:
-        parsed = urlsplit(value)
-        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-            return None
-        if parsed.username is not None or parsed.password is not None:
-            return None
-        if parsed.port not in {None, 80, 443}:
-            return None
-        if any(char in parsed.hostname for char in '<>"\\'):
-            return None
-    except (ValueError, UnicodeError):
-        return None
-    return value
 
 
 def _sources(update: Any) -> list[str]:
@@ -115,7 +97,7 @@ def _button(text: str, action: str, object_id: int) -> InlineKeyboardButton:
 
 
 def _keyboard(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=list(rows))
+    return with_home(rows)
 
 
 def notification_text(story: Any, update: Any) -> str:
@@ -283,7 +265,7 @@ class AccessMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery):
             await event.answer(text[:190], show_alert=alert)
         else:
-            await event.answer(escaped(text, 1800), parse_mode="HTML")
+            await event.answer(escaped(text, 1800), parse_mode="HTML", reply_markup=with_home())
 
     async def __call__(self, handler: Any, event: Any, data: dict[str, Any]) -> Any:
         if not isinstance(event, (Message, CallbackQuery)):
@@ -309,6 +291,17 @@ class AccessMiddleware(BaseMiddleware):
             kind = "start" if start_arg is not None else ("callback" if isinstance(event, CallbackQuery) else "message")
             key = (user.id, kind)
             if now - self.last_seen.get(key, float("-inf")) < 0.7:
+                is_date_reply = (isinstance(event, Message) and event.reply_to_message
+                    and (event.reply_to_message.text or '').startswith(DATE_PROMPT))
+                if (isinstance(event, Message) and (event.text or event.caption)
+                        and not is_date_reply and (event.forward_origin or not (event.text or '').startswith('/'))):
+                    seed = extract_story_input(event, data.get('album_messages'))
+                    item = await self.service.save_user_news(user.id, seed.text, source_url=seed.source_url,
+                        use_text=seed.use_text, input_message_id=event.message_id)
+                    await event.answer('Слишком быстро для нового анализа. Новость сохранена в «Новости пользователя». '
+                        'Откройте её и нажмите «Повторить обработку», когда закончится предыдущая.',
+                        reply_markup=with_home([[InlineKeyboardButton(text='📥 Открыть новость', callback_data=f'nopen:{item.id}')]]))
+                    return None
                 await self._tell(event, "Слишком быстро. Подождите секунду и повторите действие.")
                 return None
             if len(self.last_seen) > 1000:
@@ -319,7 +312,7 @@ class AccessMiddleware(BaseMiddleware):
         except UserError as exc:
             # UserError is the service's explicit safe-message contract.
             if isinstance(event, CallbackQuery):
-                await message.answer(escaped(str(exc), 1800), parse_mode="HTML")
+                await message.answer(escaped(str(exc), 1800), parse_mode="HTML", reply_markup=with_home())
             else:
                 await self._tell(event, str(exc))
             return None
@@ -327,19 +320,19 @@ class AccessMiddleware(BaseMiddleware):
             # Do not log raw exceptions: SDK/transport errors can contain API credentials.
             logger.error("telegram_handler_failed user_id=%s error_type=%s", user.id, type(exc).__name__)
             try:
-                await message.answer(UNEXPECTED)
+                await message.answer(UNEXPECTED, reply_markup=with_home())
             except Exception:
                 logger.warning("telegram_error_reply_failed user_id=%s", user.id)
             return None
 
 
 async def _answer(message: Message, text: str, keyboard: InlineKeyboardMarkup | None = None) -> Message:
-    return await message.answer(text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
+    return await message.answer(text, parse_mode="HTML", reply_markup=keyboard or with_home(), disable_web_page_preview=True)
 
 
 async def _replace(message: Message, text: str, keyboard: InlineKeyboardMarkup | None = None) -> None:
     try:
-        await message.edit_text(text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
+        await message.edit_text(text, parse_mode="HTML", reply_markup=keyboard or with_home(), disable_web_page_preview=True)
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             raise
@@ -361,6 +354,73 @@ def build_router(service: Any, settings: Any) -> Router:
     router.message.outer_middleware(AlbumMiddleware())
     router.message.outer_middleware(access)
     router.callback_query.outer_middleware(access)
+
+    async def show_main(message, replace=False):
+        await (_replace if replace else _answer)(message,
+            '🏠 <b>Главное меню</b>\n\nПришлите новость, ссылку или пост из канала. '
+            'Сначала сохраню её, затем обработаю и отдельно сообщу, когда можно выбрать действие.\n\n'
+            '📥 <b>Новости пользователя</b> — всё, что вы прислали, включая отложенное и ошибки обработки.\n'
+            '🗂 <b>Журнал</b> — отправленные уведомления о развитии новостей.',
+            main_keyboard())
+
+    async def show_news(message, user_id, before_id=0, replace=False):
+        items = await service.list_user_news(user_id, before_id)
+        rows = []
+        for item in items[:8]:
+            title = (item.parsed_data or {}).get('title') or item.original_text
+            rows.append([InlineKeyboardButton(text=f'{user_news.label(item)} · {str(title).replace(chr(10), " ")[:38]}',
+                                              callback_data=f'nopen:{item.id}')])
+        if len(items) > 8:
+            rows.append([InlineKeyboardButton(text='Дальше →', callback_data=f'news:{items[7].id}')])
+        if before_id:
+            rows.append([InlineKeyboardButton(text='← К началу', callback_data='news:0')])
+        text = ('📥 <b>Новости пользователя</b>\n\n' +
+                ('Выберите новость. Последние — сверху. Обработанную карточку можно открыть без повторного анализа.'
+                 if items else 'Пока пусто. Пришлите новость, текст или ссылку — она появится здесь ещё до обработки.'))
+        await (_replace if replace else _answer)(message, text, _keyboard(*rows))
+
+    async def show_news_item(message, user_id, item, replace=True):
+        story = await service.get_story(user_id, item.story_id) if item.story_id else None
+        if item.status == 'ready':
+            text = '📥 <b>Сохранённая новость</b>\n\n' + preview_text(user_news.preview(item, settings.default_check_interval_hours))
+            if story and story.status in {'active', 'paused'}:
+                text = f'📥 <b>Сохранённая новость</b> · {user_news.label(item)}\n\n' + story_text(story)
+        else:
+            text = (f'📥 <b>Сохранённая новость</b>\n{user_news.label(item)}\n\n' +
+                    escaped(item.original_text, 1400) + '\n\n' + escaped(item.error_message or
+                    'Можно вернуться в главное меню. Когда обработка завершится, пришлю отдельное сообщение.', 1000))
+        await (_replace if replace else _answer)(message, text, user_news.keyboard(item, story))
+
+    async def process_news(message, user_id, item):
+        progress = await TelegramProgress.begin(message, 'prepare', budget=progress_budget)
+        try:
+            ready = await service.process_user_news(user_id, item.id, progress.update)
+        except UserError as exc:
+            if await service.get_user_news(user_id, item.id) is None:
+                await progress.finish('Новость удалена. Обработка остановлена.', status='cancelled')
+                return
+            await progress.finish('⚠️ ' + escaped(str(exc), 1500) +
+                '\n\nНовость сохранена в «Новости пользователя».',
+                _keyboard([InlineKeyboardButton(text='📥 Открыть новость', callback_data=f'nopen:{item.id}')]), status='error')
+        except asyncio.CancelledError:
+            await progress.finish('⏹ Обработка прервана. Новость сохранена — её можно повторить из списка.',
+                _keyboard([InlineKeyboardButton(text='📥 Открыть новость', callback_data=f'nopen:{item.id}')]), status='cancelled')
+            raise
+        except Exception as exc:
+            logger.error('news_processing_failed error_type=%s', type(exc).__name__)
+            await progress.finish(UNEXPECTED + '\n\nНовость сохранена в «Новости пользователя».',
+                _keyboard([InlineKeyboardButton(text='📥 Открыть новость', callback_data=f'nopen:{item.id}')]), status='error')
+        else:
+            await progress.finish(preview_text(user_news.preview(ready, settings.default_check_interval_hours)),
+                                  user_news.keyboard(ready))
+
+    @router.message(Command('menu'), ~F.forward_origin)
+    async def menu_command(message: Message):
+        await show_main(message)
+
+    @router.message(Command('news'), ~F.forward_origin)
+    async def news_command(message: Message):
+        await show_news(message, message.from_user.id)
 
     async def run_manual_check(message, user_id, story_id):
         progress = await TelegramProgress.begin(message, "check", story_id, budget=progress_budget)
@@ -421,6 +481,7 @@ def build_router(service: Any, settings: Any) -> Router:
         text = DATE_PROMPT + '\n\n' + (str(error) if error else DATE_HELP)
         await message.answer(escaped(text, 1800), parse_mode='HTML',
                              reply_markup=ForceReply(input_field_placeholder='23.09.2026 30.09.2026', selective=True))
+        await _answer(message, 'Можно выбрать период ответом выше или вернуться в главное меню.')
 
     async def show_journal(message, user_id, window=None, cursor=0, replace=False):
         window = window or preset_window()
@@ -496,7 +557,8 @@ def build_router(service: Any, settings: Any) -> Router:
         await query.answer()
         text = f'🗂 Отправлено: {_date(update.notified_at)}\n\n' + notification_text(story, update)
         rows = list(notification_keyboard(story, update).inline_keyboard)
-        rows.pop()  # Replace generic journal shortcut with this exact period/page.
+        rows = [[b for b in row if b.callback_data not in {'jp:week', 'menu:0'}] for row in rows]
+        rows = [row for row in rows if row]
         rows.append([_button('📋 Открыть тему', 'story', story.id)])
         anchor = getattr(update, 'telegram_message_id', None)
         if action == 'ju' and anchor:
@@ -522,9 +584,9 @@ def build_router(service: Any, settings: Any) -> Router:
             + INTENSIVE_HELP + "\n\n"
             "Например: «Когда откроют новую станцию метро и изменились ли сроки?»\n\n"
             "Можно выбрать «⭐ Просто интересна тема» — запомню интерес для будущих подборок без запуска наблюдения.\n\n"
-            "Ваши сюжеты — /watching · Журнал — /journal · Мои интересы — /interests · Помощь — /help" + ready,
-            _keyboard([_button("📋 Мои наблюдения", "list", 0), _button("⭐ Мои интересы", "interests", 0)],
-                      [InlineKeyboardButton(text='🗂 Журнал уведомлений', callback_data='jp:week')]))
+            "Все присланные новости сохраню в «Новости пользователя». Когда карточка будет готова, пришлю отдельное сообщение.\n\n"
+            "Новости — /news · Ваши сюжеты — /watching · Журнал — /journal · Мои интересы — /interests · Помощь — /help" + ready,
+            main_keyboard())
 
     @router.message(Command("help"), ~F.forward_origin)
     async def help_command(message: Message) -> None:
@@ -543,12 +605,14 @@ def build_router(service: Any, settings: Any) -> Router:
             "Ручная проверка не откладывает автоматическую. Уведомления приходят только при новых важных фактах.\n\n"
             "/watching — список, история, пауза и удаление\n"
             "/journal — все отправленные уведомления с выбором периода\n"
+            "/news — все присланные новости, отложенные карточки и повтор обработки\n"
+            "/menu — главное меню из любого раздела\n"
             "/interests — ваши интересы для будущих подборок; просмотр и удаление\n"
             "/check_now — проверить выбранное наблюдение\n"
             "/cancel — как отменить создание\n\n"
             "Поиск может пропускать публикации, а ИИ — ошибаться. Сверяйте важные выводы с источниками. "
             "Не отправляйте пароли и личные документы. Удаление наблюдения удаляет его сохранённые тексты и историю. "
-            "Отдельно отмеченный интерес сохраняется; убрать его можно в /interests. Подборки пока не запущены.")
+            "Присланная новость остаётся в /news, а отмеченный интерес — в /interests; их можно убрать отдельно. Подборки пока не запущены.")
 
     @router.message(Command("interests"), ~F.forward_origin)
     async def interests_command(message: Message) -> None:
@@ -560,7 +624,9 @@ def build_router(service: Any, settings: Any) -> Router:
 
     @router.message(Command("cancel"), ~F.forward_origin)
     async def cancel(message: Message) -> None:
-        await _answer(message, "Чтобы отменить создание, нажмите «Отмена» под карточкой предпросмотра. Неподтверждённый сюжет не отслеживается. Можно сразу прислать другую тему.")
+        await _answer(message, "Нажмите «Решить позже» под карточкой: новость останется в /news, наблюдение не включится. "
+            "Для удаления из списка откройте новость и выберите «Убрать из новостей». "
+            "На старых карточках доступна «Отмена». Можно сразу прислать другую тему.")
 
     @router.message(Command("check_now"), ~F.forward_origin)
     async def check_now(message: Message, command: CommandObject) -> None:
@@ -602,11 +668,79 @@ def build_router(service: Any, settings: Any) -> Router:
 
     @router.callback_query()
     async def callback(query: CallbackQuery) -> None:
+        if query.data == 'menu:0':
+            await query.answer()
+            # Keep action/progress cards intact while ongoing edits finish.
+            await show_main(query.message)
+            return
+        if query.data == 'help:0':
+            await query.answer()
+            await help_command(query.message)
+            return
+        news_match = re.fullmatch(r'(news|nopen|nretry|nwatch|nfocus|ninterest|nlater|ninput|ndelete|ndelete_yes):([0-9]{1,10})', query.data or '')
+        if news_match:
+            news_action, raw_news_id = news_match.groups()
+            news_id = int(raw_news_id)
+            if news_id > 2_147_483_647 or (news_id == 0 and news_action != 'news'):
+                await query.answer('Кнопка устарела. Откройте /news.', show_alert=True)
+                return
+            if news_action == 'news':
+                await query.answer()
+                await show_news(query.message, query.from_user.id, news_id, replace=True)
+                return
+            item = await service.get_user_news(query.from_user.id, news_id)
+            if item is None:
+                await query.answer('Новость удалена или недоступна.', show_alert=True)
+                return
+            if news_action == 'ninterest':
+                result = await service.user_news_interest(query.from_user.id, news_id)
+                await query.answer('Интерес сохранён.' if result.created else 'Уже в ваших интересах.')
+                prefix = {'active': 'Наблюдение продолжает работать.\n\n',
+                          'paused': 'Наблюдение остаётся на паузе.\n\n'}.get(result.monitoring_status, 'Наблюдение не включено.\n\n')
+                await _replace(query.message, prefix + interest_text(result.interest), interest_keyboard(result.interest))
+                return
+            if news_action in {'nwatch', 'nfocus'}:
+                linked = await service.user_news_story(query.from_user.id, news_id)
+                await service.defer_user_news(query.from_user.id, news_id)
+                parsed = (news_action[1:], linked.id)
+                transfer = None
+            else:
+                await query.answer()
+                if news_action == 'nopen':
+                    await show_news_item(query.message, query.from_user.id, item)
+                elif news_action == 'nretry':
+                    if item.status == 'ready':
+                        await show_news_item(query.message, query.from_user.id, item)
+                    else:
+                        await process_news(query.message, query.from_user.id, item)
+                elif news_action == 'nlater':
+                    await service.defer_user_news(query.from_user.id, news_id)
+                    await _replace(query.message, '📥 Новость сохранена. Вернитесь к ней в «Новости пользователя», когда захотите.',
+                        _keyboard([InlineKeyboardButton(text='📥 Открыть новость', callback_data=f'nopen:{news_id}')]))
+                elif news_action == 'ninput':
+                    keyboard = _keyboard([InlineKeyboardButton(text='← К карточке', callback_data=f'nopen:{news_id}')])
+                    if _units(html.escape(item.original_text)) > 3300:
+                        await query.message.answer_document(BufferedInputFile(item.original_text.encode('utf-8'), filename=f'news-{item.id}.txt'),
+                            caption='Полный присланный текст новости.', reply_markup=keyboard)
+                    else:
+                        await query.message.answer('📄 <b>Присланная новость</b>\n\n' + html.escape(item.original_text),
+                            parse_mode='HTML', reply_markup=keyboard,
+                            reply_parameters=ReplyParameters(message_id=item.input_message_id, allow_sending_without_reply=True) if item.input_message_id else None)
+                elif news_action == 'ndelete':
+                    await _replace(query.message, 'Убрать эту новость из «Новости пользователя»? Сохранённый текст и карточка будут удалены. '
+                        'Если включено наблюдение, оно продолжится; его можно удалить отдельно.',
+                        _keyboard([InlineKeyboardButton(text='🗑 Да, убрать', callback_data=f'ndelete_yes:{news_id}'),
+                                   InlineKeyboardButton(text='Оставить', callback_data=f'nopen:{news_id}')]))
+                elif news_action == 'ndelete_yes':
+                    await service.delete_user_news(query.from_user.id, news_id)
+                    await show_news(query.message, query.from_user.id, replace=True)
+                return
+        else:
+            transfer = parse_transfer(query.data)
+            parsed = parse_callback(query.data)
         if (query.data or '').startswith(('jp:', 'jn:', 'ju:', 'jo:')):
             await journal_callback(query)
             return
-        transfer = parse_transfer(query.data)
-        parsed = parse_callback(query.data)
         if parsed is None and transfer is None:
             await query.answer("Эта кнопка устарела. Откройте /watching.", show_alert=True)
             return
@@ -683,7 +817,7 @@ def build_router(service: Any, settings: Any) -> Router:
         if action == "cancel":
             await query.answer()
             await service.cancel_draft(user_id, object_id)
-            await _replace(message, "Создание отменено. Пришлите другую ссылку или тему, когда захотите.")
+            await _replace(message, "Создание наблюдения отменено. Сохранённые новости доступны в «Новости пользователя».")
             return
         story = await service.get_story(user_id, object_id)
         if story is None or story.status not in {"active", "paused"}:
@@ -708,7 +842,7 @@ def build_router(service: Any, settings: Any) -> Router:
         elif action == "delete":
             await _answer(message,
                 f"Удалить наблюдение «{escaped(story.title, 200)}»?\n\nЕго тексты, источники и история будут удалены. Это действие нельзя отменить. "
-                "Отдельно отмеченный интерес останется в /interests; там его можно убрать.",
+                "Присланная новость останется в /news, отмеченный интерес — в /interests; их можно убрать отдельно.",
                 _keyboard([_button("🗑 Да, удалить", "delete_yes", object_id), _button("Оставить", "story", object_id)]))
         elif action == "delete_yes":
             await service.set_status(user_id, object_id, "deleted")
@@ -729,27 +863,12 @@ def build_router(service: Any, settings: Any) -> Router:
     @router.message(F.text | F.caption)
     async def new_story(message: Message, album_messages: list[Message] | None = None) -> None:
         seed = extract_story_input(message, album_messages)
-        text = seed.text
-        if len(text) < 10:
-            raise UserError("Добавьте немного подробностей: что произошло и какое развитие вас интересует?")
-        if len(text) > 10000:
-            raise UserError("Текст слишком длинный. Пришлите ссылку или описание до 10 000 символов.")
-        if not service.provider_ready():
-            raise UserError("Анализ пока недоступен: администратору нужно настроить API-ключ LLM. Попробуйте позже.")
-        progress = await TelegramProgress.begin(message, "prepare", budget=progress_budget)
-        try:
-            options = {'source_url': seed.source_url, 'use_text': True} if seed.use_text else {}
-            story = await service.prepare_story(message.from_user.id, text, progress=progress.update, **options)
-        except UserError as exc:
-            await progress.finish("⚠️ " + escaped(str(exc), 1800), status="error")
-        except asyncio.CancelledError:
-            await progress.finish("⏹ Подготовка прервана. Пришлите новость ещё раз.", status="cancelled")
-            raise
-        except Exception as exc:
-            logger.error("story_prepare_failed error_type=%s", type(exc).__name__)
-            await progress.finish(UNEXPECTED, status="error")
+        item = await service.save_user_news(message.from_user.id, seed.text, source_url=seed.source_url,
+            use_text=seed.use_text, input_message_id=message.message_id)
+        if item.status == 'ready':
+            await show_news_item(message, message.from_user.id, item, replace=False)
         else:
-            await progress.finish(preview_text(story), preview_keyboard(story))
+            await process_news(message, message.from_user.id, item)
 
     @router.message()
     async def unsupported(message: Message) -> None:

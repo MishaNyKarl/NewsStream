@@ -34,7 +34,7 @@ async def test_public_forwarded_news_reaches_creation(media):
         else:
             fields['video'] = Video(file_id='test-video', file_unique_id='video', width=800, height=600, duration=5)
         await harness.message(**fields)
-    call = harness.service.prepare_story.call_args
+    call = harness.service.save_user_news.call_args
     assert call.args == (100, POST)
     assert call.kwargs['use_text'] is True
     assert call.kwargs['source_url'] == 'https://t.me/test_news_channel/123'
@@ -45,15 +45,15 @@ async def test_public_forwarded_news_reaches_creation(media):
 async def test_private_or_hidden_forward_does_not_invent_public_url(forward_origin):
     harness = Harness()
     await harness.message(POST, forward_origin=forward_origin)
-    assert harness.service.prepare_story.call_args.kwargs['source_url'] is None
-    assert harness.service.prepare_story.call_args.kwargs['use_text'] is True
+    assert harness.service.save_user_news.call_args.kwargs['source_url'] is None
+    assert harness.service.save_user_news.call_args.kwargs['use_text'] is True
 
 
 async def test_caption_also_works_without_forward_header():
     harness = Harness()
     await harness.message(caption=POST, photo=PHOTO)
-    assert harness.service.prepare_story.call_args.args == (100, POST)
-    assert harness.service.prepare_story.call_args.kwargs['use_text'] is True
+    assert harness.service.save_user_news.call_args.args == (100, POST)
+    assert harness.service.save_user_news.call_args.kwargs['use_text'] is True
 
 
 async def test_forwarded_commands_are_content_not_actions_or_invites():
@@ -61,20 +61,20 @@ async def test_forwarded_commands_are_content_not_actions_or_invites():
     forwarded = '/start invite_secret Текст новости про открытие станции'
     await harness.message(forwarded, forward_origin=origin())
     assert harness.service.authorize.call_args.kwargs['start_arg'] == ''
-    assert harness.service.prepare_story.call_args.args[1] == forwarded
+    assert harness.service.save_user_news.call_args.args[1] == forwarded
 
 
 async def test_forwarded_media_without_text_gets_actionable_answer():
     harness = Harness()
     await harness.message(photo=PHOTO, forward_origin=origin())
-    harness.service.prepare_story.assert_not_awaited()
+    harness.service.save_user_news.assert_not_awaited()
     assert 'нет текста новости' in harness.text and 'пока не распознаю' in harness.text
 
 
 async def test_forwarded_media_respects_closed_access():
     harness = Harness(authorized=False)
     await harness.message(caption=POST, photo=PHOTO, forward_origin=origin())
-    harness.service.prepare_story.assert_not_awaited()
+    harness.service.save_user_news.assert_not_awaited()
     assert 'закрытый тест' in harness.text
 
 
@@ -87,14 +87,14 @@ async def test_album_caption_on_second_item_creates_exactly_one_preview():
     await asyncio.sleep(0.01)
     second = asyncio.create_task(harness.message(photo=PHOTO, caption=POST, forward_origin=origin(), media_group_id='album'))
     await asyncio.gather(first, second)
-    harness.service.prepare_story.assert_awaited_once()
-    assert harness.service.prepare_story.call_args.args == (100, POST)
+    harness.service.save_user_news.assert_awaited_once()
+    assert harness.service.save_user_news.call_args.args == (100, POST)
     assert 'Слишком быстро' not in harness.text and 'нет текста новости' not in harness.text
     previews = [call for call in harness.session.calls if isinstance(call, EditMessageText) and 'Что произошло' in call.text]
     assert len(previews) == 1
     # Late remaining images from the same album cannot duplicate the observation.
     await harness.message(photo=PHOTO, forward_origin=origin(), media_group_id='album')
-    assert harness.service.prepare_story.await_count == 1
+    assert harness.service.save_user_news.await_count == 1
 
 
 async def test_captionless_album_produces_one_help_message():
@@ -105,7 +105,7 @@ async def test_captionless_album_produces_one_help_message():
     await asyncio.gather(*(harness.message(photo=PHOTO, media_group_id='empty') for _ in range(3)))
     sends = [call for call in harness.session.calls if isinstance(call, SendMessage)]
     assert len(sends) == 1 and 'нет текста новости' in sends[0].text
-    harness.service.prepare_story.assert_not_awaited()
+    harness.service.save_user_news.assert_not_awaited()
 
 
 def test_album_combines_distinct_captions_and_preserves_post_reference():
@@ -157,7 +157,7 @@ async def test_album_collection_does_not_bypass_authorization():
             middleware.wait_seconds = 0.01
     await asyncio.gather(harness.message(photo=PHOTO, media_group_id='x'),
                          harness.message(photo=PHOTO, caption=POST, media_group_id='x'))
-    harness.service.prepare_story.assert_not_awaited()
+    harness.service.save_user_news.assert_not_awaited()
 
 
 async def test_album_cancellation_releases_buffer():
@@ -201,11 +201,13 @@ async def test_forwarded_caption_through_router_service_and_real_database(store)
     previews = [call for call in harness.session.calls if isinstance(call, EditMessageText) and call.reply_markup]
     assert len(previews) == 1
     watch = next(button.callback_data for row in previews[0].reply_markup.inline_keyboard
-                 for button in row if (button.callback_data or '').startswith('watch:'))
-    story_id = int(watch.split(':')[1])
-    saved = await repo.get_story(100, story_id)
-    assert saved.status == 'draft' and saved.original_input == post
-    assert saved.original_url == 'https://t.me/test_news_channel/123'
+                 for button in row if (button.callback_data or '').startswith('nwatch:'))
+    news_id = int(watch.split(':')[1])
+    saved = await repo.get_user_news(100, news_id)
+    assert saved.status == 'ready' and saved.original_text == post
+    assert saved.source_url == 'https://t.me/test_news_channel/123'
+    assert await repo.list_stories(100) == []
     service.fetcher.fetch.assert_not_awaited()
     await harness.callback(watch)
-    assert (await repo.get_story(100, story_id)).status == 'active'
+    saved = await repo.get_user_news(100, news_id)
+    assert (await repo.get_story(100, saved.story_id)).status == 'active'

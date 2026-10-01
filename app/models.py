@@ -149,6 +149,35 @@ class StoryUpdate(Base):
     delivery_lock_token: Mapped[str | None] = mapped_column(String(64))
 
 
+class UserNews(Base):
+    __tablename__ = 'user_news'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'input_message_id', name='uq_news_input_message'),
+        CheckConstraint("status IN ('pending','processing','ready','failed')", name='ck_user_news_status'),
+        Index('ix_user_news_owner_page', 'user_id', 'id'),
+        Index('ix_user_news_ready_notice', 'status', 'notice_sent_at', 'notice_locked_until'),
+        {'sqlite_autoincrement': True})
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.telegram_id'), nullable=False)
+    original_text: Mapped[str] = mapped_column(Text)
+    source_url: Mapped[str | None] = mapped_column(Text)
+    use_text: Mapped[bool] = mapped_column(Boolean, default=False)
+    input_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(16), default='pending')
+    parsed_data: Mapped[dict | None] = mapped_column(JSON)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    story_id: Mapped[int | None] = mapped_column(ForeignKey('stories.id', ondelete='SET NULL'), index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    processing_token: Mapped[str | None] = mapped_column(String(64))
+    processing_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    notice_suppressed: Mapped[bool] = mapped_column(Boolean, default=False)
+    notice_sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    notice_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    notice_token: Mapped[str | None] = mapped_column(String(64))
+    notice_locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
 class Feedback(Base):
     __tablename__ = "feedback"
     __table_args__ = (CheckConstraint("feedback_type IN ('useful','not_useful')", name="ck_feedback_kind"),)

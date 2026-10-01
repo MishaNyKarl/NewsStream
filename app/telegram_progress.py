@@ -6,9 +6,10 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
+from aiogram.types import InlineKeyboardButton, ReplyParameters
 
 from app.progress import ProgressEvent
+from app.navigation import with_home
 
 log = logging.getLogger(__name__)
 EDIT_TIMEOUT = 4
@@ -220,8 +221,8 @@ class TelegramProgress:
 
     def keyboard(self):
         if self.story_id is None:
-            return None
-        return InlineKeyboardMarkup(inline_keyboard=[[
+            return with_home()
+        return with_home([[
             InlineKeyboardButton(text="📋 Открыть тему", callback_data=f"story:{self.story_id}")]])
 
     def start(self):
@@ -325,6 +326,7 @@ class TelegramProgress:
     async def finish(self, text, keyboard=None, *, status="completed"):
         if self._closed:
             return
+        keyboard = keyboard or with_home()
         heading = f"<b>Проверка темы №{self.story_id}</b>\n" if self.operation == "check" else ""
         bar = stage_bar(self.operation, self.event, self.visited, status)
         footer = time_footer(self.clock() - self.started, self.started_at, datetime.now(timezone.utc))

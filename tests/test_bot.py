@@ -35,6 +35,17 @@ def change(**kwargs):
     values.update(kwargs)
     return SimpleNamespace(**values)
 
+def news(**kwargs):
+    values = dict(id=21, user_id=100, original_text='Следить за открытием станции', source_url=None,
+        use_text=True, input_message_id=1, status='ready', story_id=None, created_at=NOW, updated_at=NOW,
+        processing_until=None, error_message=None, notice_suppressed=False, notice_sent_at=None,
+        notice_token='ready-lease', parsed_data=dict(title='Открытие станции',
+            short_summary='Строительство продолжается.', current_state='Ожидается новая дата открытия.',
+            entities=['Станция'], keywords=['строительство'], search_queries=['строительство станции'],
+            watch_goals=['Срок открытия', 'Изменения проекта']))
+    values.update(kwargs)
+    return SimpleNamespace(**values)
+
 
 class FakeSession(BaseSession):
     def __init__(self):
@@ -64,6 +75,11 @@ class Harness:
             authorize=AsyncMock(return_value=SimpleNamespace(telegram_id=100) if authorized else None),
             is_admin=AsyncMock(return_value=False), provider_ready=lambda: True,
             prepare_story=AsyncMock(return_value=story(status="draft")),
+            save_user_news=AsyncMock(return_value=news(status='pending')),
+            process_user_news=AsyncMock(return_value=news()),
+            list_user_news=AsyncMock(return_value=[news()]), get_user_news=AsyncMock(return_value=news()),
+            user_news_story=AsyncMock(return_value=story(status='draft')),
+            user_news_interest=AsyncMock(), defer_user_news=AsyncMock(), delete_user_news=AsyncMock(),
             confirm_story=AsyncMock(return_value=story()), cancel_draft=AsyncMock(),
             list_stories=AsyncMock(return_value=[story()]), get_story=AsyncMock(return_value=story()),
             set_status=AsyncMock(return_value=story(status="paused")), request_check=AsyncMock(return_value="Проверка запущена."),
@@ -188,11 +204,11 @@ async def test_start_forwards_invite_and_allows_immediate_first_topic():
     await harness.message("/start invite_test")
     assert harness.service.authorize.await_args.kwargs["start_arg"] == "invite_test"
     await harness.message("Следить за открытием станции метро")
-    harness.service.prepare_story.assert_awaited_once()
+    harness.service.process_user_news.assert_awaited_once()
     assert "Что произошло" in harness.text
     buttons = [button for call in harness.session.calls if isinstance(call, (SendMessage, EditMessageText)) and call.reply_markup
                for row in call.reply_markup.inline_keyboard for button in row]
-    assert {button.callback_data for button in buttons} >= {"watch:11", "cancel:11"}
+    assert {button.callback_data for button in buttons} >= {"nwatch:21", "nlater:21", "menu:0"}
 
 
 @pytest.mark.asyncio
@@ -200,7 +216,7 @@ async def test_second_rapid_topic_is_throttled():
     harness = Harness()
     await harness.message("Наблюдать за открытием метро")
     await harness.message("Наблюдать за другим событием")
-    assert harness.service.prepare_story.await_count == 1
+    assert harness.service.process_user_news.await_count == 1
     assert "Слишком быстро" in harness.text
 
 
@@ -211,7 +227,7 @@ async def test_repeated_start_is_throttled_in_its_own_bucket():
     await harness.message("/start")
     assert "Слишком быстро" in harness.text
     await harness.message("Хочу следить за открытием станции")
-    harness.service.prepare_story.assert_awaited_once()
+    harness.service.process_user_news.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -268,7 +284,7 @@ async def test_feedback_and_future_placeholder():
 @pytest.mark.asyncio
 async def test_unexpected_exception_is_not_disclosed_or_logged(caplog):
     harness = Harness()
-    harness.service.prepare_story.side_effect = RuntimeError("private-api-key-123")
+    harness.service.process_user_news.side_effect = RuntimeError("private-api-key-123")
     await harness.message("Следить за запуском нового продукта")
     assert "Не получилось" in harness.text
     assert "private-api-key-123" not in harness.text
@@ -303,9 +319,10 @@ async def test_help_and_disabled_provider_are_candid():
     assert "24 ч." in harness.text and "/watching" in harness.text
     harness.reset_throttle()
     harness.service.provider_ready = lambda: False
+    harness.service.process_user_news.side_effect = UserError('Нужно подключить API-ключ.')
     await harness.message("Хочу следить за научной миссией")
     assert "API-ключ" in harness.text
-    harness.service.prepare_story.assert_not_awaited()
+    harness.service.save_user_news.assert_awaited_once()
 
 
 @pytest.mark.asyncio

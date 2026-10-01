@@ -73,17 +73,55 @@ class BotService:
         if not await self.repo.get_user(user_id):
             raise UserError('Доступ только по приглашению. Откройте вашу пригласительную ссылку.')
 
-    async def prepare_story(self, user_id, text, progress=None, *, source_url=None, use_text=False):
+    async def save_user_news(self, user_id, text, *, source_url=None, use_text=False, input_message_id=None):
+        return await self.repo.save_user_news(user_id, text, source_url, use_text, input_message_id)
+
+    async def list_user_news(self, user_id, before_id=0):
+        return await self.repo.list_user_news(user_id, before_id)
+
+    async def get_user_news(self, user_id, news_id):
+        return await self.repo.get_user_news(user_id, news_id)
+
+    async def user_news_story(self, user_id, news_id):
+        return await self.repo.user_news_story(user_id, news_id)
+
+    async def user_news_interest(self, user_id, news_id):
+        return await self.repo.user_news_interest(user_id, news_id)
+
+    async def defer_user_news(self, user_id, news_id):
+        return await self.repo.defer_user_news(user_id, news_id)
+
+    async def delete_user_news(self, user_id, news_id):
+        return await self.repo.delete_user_news(user_id, news_id)
+
+    async def process_user_news(self, user_id, news_id, progress=None):
+        item = await self.repo.claim_user_news(user_id, news_id)
+        if item.status == 'ready':
+            return item
+        try:
+            return await self.prepare_story(user_id, item.original_text, progress, source_url=item.source_url,
+                use_text=item.use_text, news_id=item.id, news_token=item.processing_token)
+        except (Exception, asyncio.CancelledError) as exc:
+            error = str(exc) if isinstance(exc, UserError) else 'Обработка прервана. Можно повторить из списка новостей.'
+            try:
+                await asyncio.shield(self.repo.finish_user_news(user_id, item.id, item.processing_token, error=error))
+            except UserError:
+                pass  # Deleted/reclaimed work must never resurrect its record.
+            raise
+
+    async def prepare_story(self, user_id, text, progress=None, *, source_url=None, use_text=False,
+                            news_id=None, news_token=None):
         token = progress_context.set(progress)
         try:
             async with asyncio.timeout(300):
-                return await self._prepare_story(user_id, text, source_url=source_url, use_text=use_text)
+                return await self._prepare_story(user_id, text, source_url=source_url, use_text=use_text,
+                                                news_id=news_id, news_token=news_token)
         except TimeoutError:
             raise UserError('Подготовка заняла слишком много времени. Пришлите ссылку или описание ещё раз.') from None
         finally:
             progress_context.reset(token)
 
-    async def _prepare_story(self, user_id, text, *, source_url=None, use_text=False):
+    async def _prepare_story(self, user_id, text, *, source_url=None, use_text=False, news_id=None, news_token=None):
         await self._require_user(user_id)
         if not self.provider_ready():
             raise ProviderUnavailable('Анализ пока не настроен. Администратору нужно подключить ключ нейросети.')
@@ -119,6 +157,8 @@ class BotService:
             extraction = await self.ai.extract(text_for_ai, url=url)
             extraction.search_queries = extraction.search_queries[:self.settings.max_search_queries_per_story]
             await report('saving_draft')
+            if news_id is not None:
+                return await self.repo.finish_user_news(user_id, news_id, news_token, extraction, url)
             story = await self.repo.create_draft(user_id, text, url, extraction)
             await self.repo.record_usage('story_draft', user_id=user_id, story_id=story.id)
             return story

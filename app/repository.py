@@ -21,7 +21,8 @@ from weakref import WeakKeyDictionary
 from sqlalchemy import delete, func, or_, select, text, update
 
 from app.domain import Analysis, Candidate, InterestSaveResult, StoryExtraction, UserError
-from app.models import Feedback, Source, Story, StoryUpdate, UsageEvent, User, UserInterest, utcnow
+from app.models import Feedback, Source, Story, StoryUpdate, UsageEvent, User, UserInterest, UserNews, utcnow
+from app.news_repository import NewsRepository
 from app.monitoring import INTENSIVE_DURATION, IntensiveSlotOccupied, completion_next, next_checkpoint
 
 _sqlite_locks = WeakKeyDictionary()
@@ -35,7 +36,7 @@ def _day_start():
     return utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-class Repository:
+class Repository(NewsRepository):
     def __init__(self, settings, session_factory=None):
         if session_factory is None:
             from app.db import Session
@@ -131,6 +132,7 @@ class Repository:
             if story.status == "draft":
                 story.status = "active"
                 self._event(session, "story_created", user_id, story.id)
+            await session.execute(update(UserNews).where(UserNews.story_id == story.id).values(notice_suppressed=True))
             story.monitoring_mode = "intensive"
             story.intensive_started_at = now
             story.intensive_until = now + INTENSIVE_DURATION
@@ -153,16 +155,20 @@ class Repository:
                 Story.user_id == user_id).with_for_update(key_share=True))
             if story is None:
                 raise UserError("Тема недоступна. Пришлите новость или текст заново.")
+            normalized = " ".join(unicodedata.normalize("NFKC", story.original_input).casefold().split())
+            fingerprint = hashlib.sha256(normalized.encode()).hexdigest()
             existing = await session.scalar(select(UserInterest).where(
-                UserInterest.user_id == user_id, UserInterest.source_story_id == story_id))
+                UserInterest.user_id == user_id, or_(UserInterest.source_story_id == story_id,
+                    UserInterest.input_fingerprint == fingerprint)))
             if existing is not None:
+                if story.status == "draft":
+                    await self._redact(session, story)
                 return InterestSaveResult(existing, False, story.status)
             if story.status == "deleted":
                 raise UserError("Тема больше недоступна. Пришлите новость или текст заново.")
-            normalized = " ".join(unicodedata.normalize("NFKC", story.original_input).casefold().split())
             interest = UserInterest(user_id=user_id, source_story_id=story.id, title=story.title,
                 summary=story.summary, entities=list(story.entities), keywords=list(story.keywords),
-                source_url=story.original_url, input_fingerprint=hashlib.sha256(normalized.encode()).hexdigest())
+                source_url=story.original_url, input_fingerprint=fingerprint)
             session.add(interest)
             await session.flush()
             if story.status == "draft":
@@ -224,6 +230,7 @@ class Repository:
         return await self._admit(user_id, username, first_name, True, True)
 
     async def _redact(self, session, story):
+        await session.execute(update(UserNews).where(UserNews.story_id == story.id).values(notice_suppressed=True))
         await session.execute(delete(Feedback).where(Feedback.story_id == story.id))
         await session.execute(delete(Source).where(Source.story_id == story.id))
         await session.execute(delete(StoryUpdate).where(StoryUpdate.story_id == story.id))
@@ -277,6 +284,7 @@ class Repository:
                 story.next_check_at = utcnow()
                 story.updated_at = utcnow()
                 self._event(session, "story_created", user_id, story.id)
+            await session.execute(update(UserNews).where(UserNews.story_id == story.id).values(notice_suppressed=True))
             return story
 
     async def list_stories(self, user_id):

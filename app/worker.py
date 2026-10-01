@@ -5,9 +5,31 @@ import tempfile
 from pathlib import Path
 
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.types import ReplyParameters
 from app.bot import notification_text, notification_keyboard
+from app.user_news import ready_text, keyboard as news_keyboard
 
 log = logging.getLogger(__name__)
+
+async def deliver_news_ready(service, bot):
+    for item in await service.repo.pending_news_notices():
+        success = False
+        retry_after = 0
+        try:
+            fresh = await service.repo.get_user_news(item.user_id, item.id)
+            if fresh and fresh.status == 'ready' and not fresh.notice_suppressed and fresh.notice_sent_at is None:
+                await bot.send_message(item.user_id, ready_text(fresh), parse_mode='HTML',
+                    reply_markup=news_keyboard(fresh), disable_notification=False, request_timeout=30,
+                    reply_parameters=ReplyParameters(message_id=fresh.input_message_id,
+                        allow_sending_without_reply=True) if fresh.input_message_id else None)
+                success = True
+        except TelegramForbiddenError:
+            await service.repo.defer_user_news(item.user_id, item.id)
+        except TelegramRetryAfter as exc:
+            retry_after = exc.retry_after
+        except Exception as exc:
+            await service._error('news_ready_notification', exc, user_id=item.user_id)
+        await service.repo.mark_news_notice(item.user_id, item.id, item.notice_token, success, retry_after=retry_after)
 
 async def deliver_notifications(service, bot):
     for update, story in await service.repo.pending_notifications(limit=1):
@@ -38,6 +60,7 @@ async def run_worker(service, bot):
             heartbeat.write_text(str(time.time()))
             try:
                 await deliver_notifications(service, bot)
+                await deliver_news_ready(service, bot)
                 if service.provider_ready() and len(check_tasks) < 2:
                     for story_id in await service.repo.due_story_ids(limit=2-len(check_tasks)):
                         story = await service.repo.claim_story(story_id)

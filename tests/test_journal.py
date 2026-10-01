@@ -167,7 +167,7 @@ async def test_custom_dates_force_reply_and_validation_never_create_a_story():
     harness.reset_throttle()
     await harness.message('31.02.2026', reply_to_message=original)
     assert 'Не удалось разобрать' in harness.text
-    last = [c for c in harness.session.calls if isinstance(c, SendMessage)][-1]
+    last = [c for c in harness.session.calls if isinstance(c, SendMessage) and isinstance(c.reply_markup, ForceReply)][-1]
     assert last.text.startswith(DATE_PROMPT) and isinstance(last.reply_markup, ForceReply)
     harness.reset_throttle()
     await harness.message('01.01.2026 02.01.2026', reply_to_message=original)

@@ -187,7 +187,7 @@ async def test_input_through_real_router_service_database_to_interest_list_and_r
         await harness.message('Мне интересны новости про запуск сервиса')
     preview = next(call for call in harness.session.calls if isinstance(call, EditMessageText))
     action = next(button.callback_data for row in preview.reply_markup.inline_keyboard
-                  for button in row if (button.callback_data or '').startswith('interest:'))
+                  for button in row if (button.callback_data or '').startswith('ninterest:'))
     # Preference buttons must work even if the model becomes unavailable.
     service.provider_ready = lambda: False
     await harness.callback(action)
@@ -232,7 +232,7 @@ async def test_empty_interests_is_helpful_and_forwarded_command_is_still_news():
     assert 'Пока пусто' in harness.text and 'Просто интересна тема' in harness.text
     harness.reset_throttle()
     await harness.message('/interests — новости науки и космоса', forward_origin=origin())
-    harness.service.prepare_story.assert_awaited_once()
+    harness.service.process_user_news.assert_awaited_once()
     assert harness.service.list_interests.await_count == 1
 
 
