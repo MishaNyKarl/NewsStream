@@ -30,6 +30,7 @@ from app.admin.state import State
 from app.admin.product import report as product_report
 from app.commerce import Commerce
 from app.errors import UserError
+from app.models import Plan
 
 COOKIE = '__Host-newswatch-admin'
 ROOT = Path(__file__).parent
@@ -355,8 +356,19 @@ def create_app(config=None, data=None, ops=None):
             uid = int(request.query_params['user']) if request.query_params.get('user') else None
             if uid is not None and not 0 < uid < 2**63:
                 raise ValueError
+            copied_plan = None
+            if request.query_params.get('copy_plan'):
+                if request.state.admin_session.get('role', 'owner') not in {'owner', 'admin'}:
+                    raise HTTPException(403, 'Копирование тарифа доступно администратору.')
+                plan_id = int(request.query_params['copy_plan'])
+                if not 0 < plan_id < 2**31:
+                    raise ValueError
+                async with data.sessions() as session:
+                    copied_plan = await session.get(Plan, plan_id)
+                if copied_plan is None:
+                    raise HTTPException(404, 'Тариф не найден.')
             result = await commerce.dashboard(uid)
-            return render(request, 'commerce.html', result=result, key=lambda: str(uuid4()))
+            return render(request, 'commerce.html', result=result, copied_plan=copied_plan, key=lambda: str(uuid4()))
         except UserError as exc:
             return render(request, 'message.html', status=400, message=str(exc))
         except ValueError:

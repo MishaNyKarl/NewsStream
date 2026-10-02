@@ -482,3 +482,41 @@ async def test_old_single_owner_release_rejects_delegated_session_on_rollback(ad
     await client.post('/login', data=dict(csrf=csrf(page), username='rollback-viewer', password=PASSWORD))
     old_state = State(config.state_path, config.username+config.password_hash)
     assert old_state.session(client.cookies.get(COOKIE), 28800, 1800) is None
+
+@pytest.mark.parametrize('discussion', [False, True])
+async def test_copy_tariff_prefills_all_fields_without_saving(admin, discussion):
+    from bs4 import BeautifulSoup
+    from sqlalchemy import func
+    from app.models import Plan
+    client, _, data, *_ = admin
+    values = dict(name='Тест "A" <новый>', experiment='trial-A', price_minor=12900, period_days=7,
+                  stories=0, intensive_slots=2, manual_daily=4, llm_daily=31, discussion=discussion,
+                  news_credits=3, check_credits=0, discussion_credits=2)
+    async with data.sessions.begin() as session:
+        session.add(Plan(**values))
+    await login(client)
+    response = await client.get('/commerce?copy_plan=1')
+    assert response.status_code == 200
+    soup = BeautifulSoup(response.text, 'html.parser')
+    details = soup.select_one('#plan-form')
+    assert details.has_attr('open')
+    form = details.select_one('form')
+    for field, value in values.items():
+        if field == 'discussion':
+            assert form.select_one('select[name=discussion] option[selected]')['value'] == str(int(value))
+        else:
+            assert form.select_one(f'input[name={field}]')['value'] == str(value)
+    async with data.sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(Plan)) == 1
+    payload = {i['name']: i.get('value', '') for i in form.select('input[name]')}
+    payload.update(name='Отредактированная копия', stories='8', discussion=str(int(discussion)), reason='Новая гипотеза')
+    assert (await client.post('/commerce', data=payload)).status_code == 303
+    async with data.sessions() as session:
+        original, copy = await session.get(Plan, 1), await session.get(Plan, 2)
+        assert original.name == values['name'] and original.stories == 0
+        assert copy.name == payload['name'] and copy.stories == 8
+        for field, value in values.items():
+            if field not in {'name', 'stories'}:
+                assert getattr(copy, field) == value
+    assert (await client.get('/commerce?copy_plan=999999')).status_code == 404
+    assert (await client.get('/commerce?copy_plan=invalid')).status_code == 400
