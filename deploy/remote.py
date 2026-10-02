@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import stat
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -29,6 +30,8 @@ INCOMING = Path('/var/lib/newswatch-deploy/incoming')
 STATE = ROOT / 'deploy-state'
 RELEASES = ROOT / 'releases'
 HOST_SCRIPT = '/usr/local/lib/newswatch/deploy_remote.py'
+ADMIN_ENV = Path('/etc/newswatch-admin/admin.env')
+ADMIN_COMPOSE_ENV = Path('/etc/newswatch-admin/compose.env')
 MAX_ARCHIVE = 20 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
 REVISION = re.compile(r'[0-9a-f]{40}')
@@ -120,6 +123,11 @@ def extract_release(path, destination, sha):
                 with target.open('xb') as stream:
                     shutil.copyfileobj(archive.extractfile(member), stream)
                 target.chmod(0o755 if member.mode & 0o111 else 0o644)
+    # The root deployment process uses umask 077, but images run as UID 10001.
+    # COPY preserves nested directory modes: unreadable migration directories
+    # make Alembic report missing revisions even though the files exist.
+    for directory, _, _ in os.walk(destination):
+        Path(directory).chmod(0o755 if Path(directory) != destination else 0o750)
 
 
 def command(args, timeout=180, capture=False):
@@ -147,6 +155,14 @@ def switch_pointer(source):
     temporary.unlink(missing_ok=True)
     temporary.symlink_to(source, target_is_directory=True)
     temporary.replace(ROOT / 'current')
+
+
+def admin_compose(source, image, sha, *args, label_revision=None):
+    override = STATE / sha / ('admin-' + hashlib.sha256(image.encode()).hexdigest()[:12] + '.yaml')
+    override.write_text('services:\n  admin:\n    image: ' + json.dumps(image) +
+        '\n    environment:\n      ADMIN_REVISION: ' + json.dumps(label_revision or sha) + '\n')
+    return ['docker', 'compose', '--project-directory', str(source), '--env-file', str(ADMIN_COMPOSE_ENV),
+        '-p', 'newswatch-admin', '-f', str(source / 'compose.admin.yaml'), '-f', str(override), *args]
 
 
 def upload(sha, stream):
@@ -225,6 +241,21 @@ def restore(data):
     command(compose(source, previous['image'], data['revision'], 'up', '-d', '--no-build',
         '--no-deps', '--wait', '--wait-timeout', '120', 'bot', 'worker',
         label_revision=previous.get('revision', 'legacy')), timeout=150)
+    if data.get('admin_started'):
+        admin_previous = data.get('admin_previous')
+        if admin_previous:
+            admin_source = Path(admin_previous['source'])
+            if admin_source.parent != RELEASES:
+                raise DeployError('invalid_previous_admin_release')
+            command(admin_compose(admin_source, admin_previous['image'], data['revision'],
+                'up', '-d', '--no-build', '--wait', '--wait-timeout', '90', 'admin',
+                label_revision=admin_previous['revision']), timeout=120)
+        else:
+            # First installation failed: remove only its named container, retain its data volume.
+            names = command(['docker', 'ps', '-a', '--format', '{{.Names}}',
+                '--filter', 'name=^newswatch-admin-admin-1$'], capture=True)
+            if names:
+                command(['docker', 'rm', '-f', 'newswatch-admin-admin-1'], timeout=40)
     if source != ROOT:
         switch_pointer(source)
     elif (ROOT / 'current').is_symlink():
@@ -268,17 +299,44 @@ def run(sha):
             (release / '.env').symlink_to(ROOT / '.env')
             env_digest = hashlib.sha256((ROOT / '.env').read_bytes()).hexdigest()
             image = 'newswatch:' + sha
+            with_admin = (release / 'compose.admin.yaml').is_file()
+            if with_admin:
+                if not ADMIN_ENV.is_file() or not ADMIN_COMPOSE_ENV.is_file():
+                    raise DeployError('admin_settings_not_provisioned')
+                admin_names = command(['docker', 'ps', '-a', '--format', '{{.Names}}',
+                    '--filter', 'name=^newswatch-admin-admin-1$'], capture=True)
+                if admin_names:
+                    if not (previous_source / 'compose.admin.yaml').is_file():
+                        raise DeployError('previous_admin_source_unknown')
+                    admin_id = command(['docker', 'inspect', '--format', '{{.Image}}',
+                        'newswatch-admin-admin-1'], capture=True)
+                    admin_tag = 'newswatch-admin:rollback-' + sha
+                    command(['docker', 'image', 'tag', admin_id, admin_tag])
+                    data['admin_previous'] = {'source': str(previous_source), 'image': admin_tag,
+                        'revision': previous_revision}
+                save_state(data, admin_requested=True, admin_started=False)
             save_state(data, phase='building')
             command(compose(release, image, sha, 'build', 'bot'), timeout=900)
+            if with_admin:
+                save_state(data, phase='building_admin')
+                command(admin_compose(release, 'newswatch-admin:' + sha, sha, 'build', 'admin'), timeout=900)
             save_state(data, phase='backup')
             backup = ROOT / 'backups' / ('deploy-' + sha)
-            backup.mkdir(mode=0o700, exist_ok=True)
+            backup.mkdir(mode=0o700, parents=True, exist_ok=True)
             with (backup / 'database.dump').open('wb') as output:
                 subprocess.run(['docker', 'exec', 'newswatch-db-1', 'pg_dump', '-U', 'newswatch',
                     '-d', 'newswatch', '-Fc'], stdout=output, check=True, timeout=120)
             if (backup / 'database.dump').stat().st_size < 100:
                 raise DeployError('empty_backup')
             data['backup'] = backup.name
+            if data.get('admin_previous'):
+                mount = command(['docker', 'volume', 'inspect', '--format', '{{.Mountpoint}}',
+                    'newswatch-admin_admin_state'], capture=True)
+                admin_db = Path(mount) / 'admin.sqlite3'
+                if admin_db.is_file():
+                    with sqlite3.connect(str(admin_db)) as source_db:
+                        with sqlite3.connect(str(backup / 'admin.sqlite3')) as target_db:
+                            source_db.backup(target_db)
             save_state(data, phase='migrating')
             for action in [('upgrade', 'head'), ('check',)]:
                 command(['docker', 'run', '--rm', '--memory', '256m', '--cpus', '0.7',
@@ -303,8 +361,12 @@ def run(sha):
                 health = command(['docker', 'inspect', '--format', '{{.State.Health.Status}}', container], capture=True)
                 if health != 'healthy':
                     raise DeployError('application_unhealthy')
+            if with_admin:
+                save_state(data, phase='switching_admin', admin_started=True)
+                command(admin_compose(release, 'newswatch-admin:' + sha, sha,
+                    'up', '-d', '--no-build', '--wait', '--wait-timeout', '90', 'admin'), timeout=120)
             switch_pointer(release)
-            save_state(data, status='succeeded', phase='complete', finished_at=now(), admin_deployed=False)
+            save_state(data, status='succeeded', phase='complete', finished_at=now(), admin_deployed=with_admin)
         except BaseException as exc:
             error = str(exc) if isinstance(exc, DeployError) else type(exc).__name__
             save_state(data, status='running', phase='restoring', error=error)

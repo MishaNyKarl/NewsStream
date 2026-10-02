@@ -8,3 +8,11 @@ __pycache__
 .venv
 backups
 private-access*
+work
+outputs
+.deploy-state
+deploy-state
+releases
+current
+*.key
+*.pem

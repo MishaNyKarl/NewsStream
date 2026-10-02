@@ -50,6 +50,18 @@ def test_extract_valid_release_preserves_examples(tmp_path):
     assert (destination / '.env.example').read_text() == 'TOKEN=placeholder'
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX modes are preserved by Docker COPY')
+def test_extracted_directories_readable_for_nonroot_container(tmp_path):
+    path = archive(tmp_path, [('migrations/versions/0001.py', 'revision="0001"')])
+    old_mask = os.umask(0o077)
+    try:
+        remote.extract_release(path, tmp_path / 'release', SHA)
+    finally:
+        os.umask(old_mask)
+    assert (tmp_path / 'release/migrations/versions').stat().st_mode & 0o777 == 0o755
+    assert (tmp_path / 'release/migrations/versions/0001.py').stat().st_mode & 0o777 == 0o644
+
+
 def test_archive_expansion_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(remote, 'MAX_EXPANDED', 20)
     with pytest.raises(remote.DeployError, match='expanded_archive_too_large'):
@@ -128,7 +140,7 @@ def test_failed_release_restores_previous_and_preserves_settings(tmp_path, monke
     with pytest.raises(remote.DeployError, match='deployment_failed'):
         remote.run(SHA)
     state = remote.load_state(SHA)
-    assert failed and state['status'] == 'rolled_back'
+    assert failed and state['status'] == 'rolled_back', state
     assert state['previous']['source'] == str(root)
     assert (root / '.env').read_text() == 'EXAMPLE=preserved\n'
     assert not (root / 'current').exists()
