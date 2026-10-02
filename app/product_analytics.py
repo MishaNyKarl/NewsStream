@@ -16,7 +16,7 @@ BUSINESS_EVENTS = {
     'notification_feedback_useful': 'feedback_useful', 'notification_feedback_not_useful': 'feedback_not_useful',
 }
 CATEGORIES = {'start', 'menu', 'watching', 'news', 'journal', 'interests', 'check', 'feedback',
-              'pause', 'resume', 'delete', 'intensive', 'input', 'help', 'other'}
+              'pause', 'resume', 'delete', 'intensive', 'input', 'help', 'account', 'other'}
 EVENTS = set(BUSINESS_EVENTS.values()) | {f'interaction_{c}' for c in CATEGORIES} | {
     'news_submitted', 'news_ready', 'news_failed', 'news_deferred', 'news_deleted', 'watch_deleted',
     'notification_sent', 'notification_failed', 'ready_notice_sent', 'ready_notice_failed',
@@ -36,6 +36,7 @@ def interaction_category(event):
     if callback is not None:
         prefix = callback.split(':', 1)[0]
         return {
+            'account': 'account',
             'home': 'menu', 'main': 'menu', 'watching': 'watching', 'story': 'watching',
             'list': 'watching', 'watch': 'watching', 'card': 'watching', 'history': 'journal',
             'focus': 'intensive', 'interest_view': 'interests', 'interest_remove': 'interests',
@@ -52,7 +53,7 @@ def interaction_category(event):
     command = text.split(maxsplit=1)[0].split('@', 1)[0]
     return {'/start': 'start', '/menu': 'menu', '/news': 'news', '/watching': 'watching',
             '/journal': 'journal', '/interests': 'interests', '/check_now': 'check',
-            '/help': 'help', '/cancel': 'other'}.get(command, 'other')
+            '/help': 'help', '/account': 'account', '/cancel': 'other'}.get(command, 'other')
 
 
 class ProductAnalyticsRepository:

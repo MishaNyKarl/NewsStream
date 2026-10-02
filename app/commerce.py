@@ -70,6 +70,12 @@ class Commerce:
             account = await session.get(Account, uid)
             return {'account': account, 'limits': await limits(session, uid, self.settings)}
 
+    async def credit_history(self, uid):
+        async with self.sessions() as session:
+            return list(await session.scalars(select(CreditEntry).where(
+                CreditEntry.user_id == uid, CreditEntry.delta != 0).order_by(
+                CreditEntry.created_at.desc(), CreditEntry.id.desc()).limit(10)))
+
     async def role(self, uid, inherited):
         async with self.sessions() as session:
             account = await session.get(Account, uid)

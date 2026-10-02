@@ -18,6 +18,7 @@ def main_keyboard():
          InlineKeyboardButton(text='🗂 Журнал', callback_data='jp:week')],
         [InlineKeyboardButton(text='📋 Мои наблюдения', callback_data='list:0'),
          InlineKeyboardButton(text='⭐ Мои интересы', callback_data='interests:0')],
+        [InlineKeyboardButton(text='💎 Подписка и кредиты', callback_data='account:home')],
         [InlineKeyboardButton(text='❔ Как пользоваться', callback_data='help:0')]])
 
 

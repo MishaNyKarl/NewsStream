@@ -24,6 +24,7 @@ from app.journal import DATE_HELP, DATE_PROMPT, PAGE_SIZE, date_window, parse_jo
 from app.telegram_progress import ProgressEditBudget, TelegramProgress
 from app.telegram_input import AlbumMiddleware, extract_story_input
 from app.product_analytics import interaction_category
+from app.account_ui import account_keyboard
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_UNITS = 3900
@@ -31,7 +32,7 @@ DENIED = "Это закрытый тест. Попросите организа�
 UNEXPECTED = "Не получилось завершить действие. Попробуйте чуть позже. Ваши наблюдения сохранены."
 INTENSIVE_HELP = (
     "⚡ «Следить внимательнее»: проверки через 30 мин, 1, 2, 4, 8, 12 и 24 ч от включения. "
-    "Затем — обычное расписание. В тесте — <b>одна такая тема на пользователя</b>."
+    "Затем — обычное расписание. Количество срочных тем зависит от вашего тарифа: /account."
 )
 
 
@@ -683,6 +684,11 @@ def build_router(service: Any, settings: Any) -> Router:
 
     @router.callback_query()
     async def callback(query: CallbackQuery) -> None:
+        if query.data in {'account:home', 'account:prices', 'account:history', 'account:manage'}:
+            await query.answer()
+            view = query.data.split(':')[1]
+            await _replace(query.message, await service.account_text(query.from_user.id, view), account_keyboard(view))
+            return
         if query.data == 'menu:0':
             await query.answer()
             # Keep action/progress cards intact while ongoing edits finish.
@@ -875,7 +881,7 @@ def build_router(service: Any, settings: Any) -> Router:
 
     @router.message(Command('account'), ~F.forward_origin)
     async def account_command(message: Message):
-        await _answer(message, await service.account_text(message.from_user.id))
+        await _answer(message, await service.account_text(message.from_user.id), account_keyboard())
 
     @router.message(Command('discuss'), ~F.forward_origin)
     async def discuss_command(message: Message):

@@ -167,7 +167,7 @@ async def test_downtime_failure_retry_and_mode_change_during_check(store, clock)
 def test_card_explains_single_slot_pause_and_next_check():
     item = ui_story(monitoring_mode="intensive", intensive_until=START + timedelta(hours=24), next_check_at=START)
     text = story_text(item)
-    assert "одна такая тема" in text and "30 мин, 1, 2, 4, 8, 12 и 24" in text
+    assert "Количество срочных тем зависит от вашего тарифа" in text and "30 мин, 1, 2, 4, 8, 12 и 24" in text
     assert "Ближайшая проверка" in text and "МСК" in text
     item.status = "paused"
     assert "Место занято" in story_text(item)
@@ -200,6 +200,6 @@ async def test_telegram_preview_and_declining_transfer_preserve_draft():
     harness.service.get_story.return_value = ui_story(status="draft")
     harness.service.set_monitoring_mode = AsyncMock()
     await harness.callback("card:11")
-    assert "одна такая тема" in harness.text
+    assert "Количество срочных тем зависит от вашего тарифа" in harness.text
     assert "focus:11" in str(harness.session.calls)
     harness.service.set_monitoring_mode.assert_not_awaited()

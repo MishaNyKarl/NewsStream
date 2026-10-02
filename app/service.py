@@ -463,20 +463,11 @@ class BotService:
                         not failed and outcome.status not in {'error', 'cancelled'}))
         return outcome
 
-    async def account_text(self, user_id):
-        import html
+    async def account_text(self, user_id, view='home'):
+        from app.account_ui import account_screen
         value = await self.commerce.snapshot(user_id)
-        account, p = value['account'], value['limits']
-        return (f"<b>Тариф: {html.escape(p['name'])}</b>\n"
-                f"Баланс: {account.balance if account else 0} кредитов\n"
-                f"Наблюдений: {p['stories']}; срочных одновременно: {p['intensive_slots']}\n"
-                f"Ручных проверок в сутки UTC: {p['manual_daily']}\n"
-                f"Обсуждение: {'доступно' if p['discussion'] else 'недоступно'}\n"
-                f"Разбор новости: {p['news_credits']} кр.; проверка: {p['check_credits']} кр.; "
-                f"ответ в обсуждении: {p['discussion_credits']} кр.\n\n"
-                "Проверки по расписанию тоже расходуют кредиты. Проверка без новых фактов оплачивается, "
-                "если завершилась; при ошибке кредиты возвращаются. "
-                "Пополнение и смена тарифа — через администратора. Автоматическое продление пока не подключено.")
+        entries = await self.commerce.credit_history(user_id) if view == 'history' else ()
+        return account_screen(value, view, entries)
 
     async def discuss(self, user_id, story_id, question):
         story = await self.repo.get_story(user_id, story_id)
