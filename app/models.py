@@ -1,7 +1,7 @@
 """Persistence models. Dates are UTC-aware on PostgreSQL and in SQLite tests."""
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, LargeBinary, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -42,6 +42,15 @@ class User(Base):
     manual_quota_day: Mapped[datetime | None] = mapped_column(UTCDateTime)
     manual_checks_today: Mapped[int] = mapped_column(Integer, default=0)
     last_manual_check_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+class UserProfile(Base):
+    __tablename__ = 'user_profiles'
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.telegram_id', ondelete='CASCADE'), primary_key=True)
+    display_name: Mapped[str | None] = mapped_column(String(512))
+    username: Mapped[str | None] = mapped_column(String(128))
+    avatar: Mapped[bytes | None] = mapped_column(LargeBinary)
+    checked_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
 class Story(Base):

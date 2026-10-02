@@ -30,7 +30,8 @@ from app.admin.state import State
 from app.admin.product import report as product_report
 from app.commerce import Commerce
 from app.errors import UserError
-from app.models import Plan
+from app.models import Plan, UserProfile
+from app.admin.people import directory, event_name
 
 COOKIE = '__Host-newswatch-admin'
 ROOT = Path(__file__).parent
@@ -126,6 +127,7 @@ def create_app(config=None, data=None, ops=None):
     templates.filters['duration'] = lambda v: '—' if v is None else (
         f'{v/86400:.1f} дн.' if v >= 86400 else f'{v/3600:.1f} ч' if v >= 3600 else f'{v/60:.1f} мин')
     templates.filters['percent'] = lambda v: '—' if v is None else f'{v:.1f}%'
+    templates.filters['event_name'] = event_name
 
     def actor(request):
         return request.state.admin_session.get('principal', config.username)
@@ -220,6 +222,11 @@ def create_app(config=None, data=None, ops=None):
                 if name == 'costs':
                     costs = await data.costs(filters, state.calculator())
                     return render(request, 'costs.html', costs=costs, more=costs['more'], **common)
+                if name == 'users':
+                    search = request.query_params.get('q', '').strip()[:100]
+                    people = await directory(data, filters, search)
+                    return render(request, 'users.html', result=people, search=search, now=datetime.now(MSK),
+                                  more=people['more'], **common)
                 headers, rows, more = await data.table(name, filters)
                 return render(request, 'table.html', headers=headers, rows=rows, more=more, **common)
         except Exception:
@@ -342,6 +349,15 @@ def create_app(config=None, data=None, ops=None):
     async def health(request):
         return PlainTextResponse('ok')  # Process liveness only, no public operational data.
 
+    async def avatar(request):
+        uid = request.path_params['uid']
+        async with data.sessions() as session:
+            from sqlalchemy import select
+            content = await session.scalar(select(UserProfile.avatar).where(UserProfile.user_id == uid))
+        if not content:
+            raise HTTPException(404, 'Фото недоступно')
+        return Response(content, media_type='image/jpeg')
+
     async def commerce_page(request):
         try:
             if request.method == 'POST':
@@ -403,6 +419,7 @@ def create_app(config=None, data=None, ops=None):
               Route('/project', project), Route('/restart/prepare', restart_prepare, methods=['POST']),
               Route('/analytics', analytics), Route('/analytics.csv', analytics),
               Route('/commerce', commerce_page, methods=['GET', 'POST']),
+              Route('/users/{uid:int}/avatar', avatar),
               Route('/access', access_page, methods=['GET', 'POST']),
               Route('/restart', restart, methods=['POST']), Route('/docs', docs), Route('/audit', audit),
               Mount('/static', StaticFiles(directory=ROOT/'static'), name='static')]

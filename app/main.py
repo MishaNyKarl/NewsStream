@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.db import close_db
 from app.service import BotService
 from app.worker import run_worker
+from app.profiles import refresh_profiles
 
 async def bot_heartbeat():
     while True:
@@ -30,6 +31,7 @@ async def main(role='bot'):
     bot = Bot(settings.telegram_bot_token, default=DefaultBotProperties(
         parse_mode=ParseMode.HTML, link_preview=LinkPreviewOptions(is_disabled=True)))
     heartbeat_task = None
+    profile_task = None
     try:
         if role == 'worker':
             await run_worker(service, bot)
@@ -54,9 +56,13 @@ async def main(role='bot'):
             dp = Dispatcher()
             dp.include_router(build_router(service, settings))
             heartbeat_task = asyncio.create_task(bot_heartbeat())
+            profile_task = asyncio.create_task(refresh_profiles(bot, service.repo.session_factory))
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(),
                 handle_signals=True, tasks_concurrency_limit=20)
     finally:
+        if profile_task:
+            profile_task.cancel()
+            await asyncio.gather(profile_task, return_exceptions=True)
         if heartbeat_task:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)

@@ -520,3 +520,31 @@ async def test_copy_tariff_prefills_all_fields_without_saving(admin, discussion)
                 assert getattr(copy, field) == value
     assert (await client.get('/commerce?copy_plan=999999')).status_code == 404
     assert (await client.get('/commerce?copy_plan=invalid')).status_code == 400
+
+async def test_user_directory_search_activity_and_private_avatar(admin):
+    from datetime import timedelta
+    from app.models import UserProfile, ProductEvent
+    client, _, data, *_ = admin
+    now = utcnow()
+    async with data.sessions.begin() as session:
+        session.add(User(telegram_id=765, first_name='Alice', username='alice_test', last_seen_at=now-timedelta(days=90)))
+        await session.flush()
+        session.add(UserProfile(user_id=765, display_name='Alice <Example>', username='alice_test', avatar=b'\xff\xd8\xfftest'))
+        session.add(ProductEvent(user_id=765, event='interaction_menu', created_at=now))
+        session.add(ProductEvent(user_id=765, event='news_submitted', created_at=now))
+    assert (await client.get('/users/765/avatar')).status_code == 303
+    await login(client)
+    response = await client.get('/users?q=alice')
+    assert response.status_code == 200 and 'Alice &lt;Example&gt;' in response.text
+    assert '/commerce?user=765' in response.text and '/users/765/avatar' in response.text
+    assert '1 / 1' in response.text
+    assert 'Alice' in (await client.get('/users?q=@alice_test')).text
+    assert 'Alice' not in (await client.get('/users?q=nonexistent')).text
+    assert 'Alice' not in (await client.get('/users?q=%25')).text
+    detail = await client.get('/users?user=765')
+    assert detail.status_code == 200 and 'Последние действия' in detail.text
+    photo = await client.get('/users/765/avatar')
+    assert photo.content == b'\xff\xd8\xfftest' and photo.headers['content-type'] == 'image/jpeg'
+    assert photo.headers['cache-control'] == 'no-store'
+    assert (await client.get('/users/999/avatar')).status_code == 404
+    assert 'Alice &lt;Example&gt;' in (await client.get('/commerce?user=765')).text

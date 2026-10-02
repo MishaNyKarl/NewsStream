@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.errors import UserError
-from app.models import Account, Charge, CommerceAudit, CreditEntry, Plan, TopUp, UsageEvent, User, utcnow
+from app.models import Account, Charge, CommerceAudit, CreditEntry, Plan, TopUp, UsageEvent, User, UserProfile, utcnow
 
 
 _sqlite_locks = WeakKeyDictionary()
@@ -234,11 +234,15 @@ class Commerce:
     async def dashboard(self, uid=None):
         async with self.sessions() as session:
             plans = list(await session.scalars(select(Plan).order_by(Plan.id.desc()).limit(100)))
-            people = (await session.execute(select(User.telegram_id, Account.balance, Account.plan_id,
-                Account.expires_at, Account.role).outerjoin(Account, Account.user_id == User.telegram_id)
+            people = (await session.execute(select(User.telegram_id, func.coalesce(UserProfile.display_name, User.first_name).label("name"),
+                func.coalesce(UserProfile.username, User.username).label("username"), Account.balance, Account.plan_id,
+                Account.expires_at, Account.role).outerjoin(Account, Account.user_id == User.telegram_id).outerjoin(UserProfile, UserProfile.user_id == User.telegram_id)
                 .order_by(User.telegram_id).limit(100))).mappings().all()
-            result = dict(plans=plans, people=people, uid=uid, account=None, policy=None)
+            result = dict(plans=plans, people=people, uid=uid, account=None, policy=None, person=None)
             if uid:
+                user = await session.get(User, uid)
+                profile = await session.get(UserProfile, uid)
+                result['person'] = (profile.display_name if profile and profile.display_name else user.first_name or user.username) if user else None
                 result['account'] = await session.get(Account, uid)
                 result['policy'] = await limits(session, uid, self.settings)
                 if result['policy']['plan_id'] is None:
