@@ -196,11 +196,14 @@ def enqueue(sha):
         data = {'revision': sha, 'status': 'queued', 'phase': 'queued', 'created_at': now()}
         save_state(data)
         try:
-            command(['systemd-run', '--unit=newswatch-deploy-' + sha, '--collect',
-                '--property=Type=oneshot', '--property=RuntimeMaxSec=1800', '--property=TimeoutStopSec=180',
+            command(['systemd-run', '--unit=newswatch-deploy-' + sha, '--collect', '--no-block',
+                '--property=Type=oneshot', '--property=TimeoutStartSec=1800', '--property=TimeoutStopSec=180',
                 '--property=ExecStopPost=/usr/bin/python3 ' + HOST_SCRIPT + ' rescue ' + sha,
                 '/usr/bin/python3', HOST_SCRIPT, 'run', sha], timeout=30)
         except DeployError:
+            current = load_state(sha)
+            if current['status'] in {'running', 'succeeded', 'rolled_back'}:
+                return public_state(current)
             save_state(data, status='failed', phase='enqueue', error='cannot_start_server_job')
             raise
         return public_state(data)

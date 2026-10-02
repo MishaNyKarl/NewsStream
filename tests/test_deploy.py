@@ -1,4 +1,5 @@
 import io
+import os
 import tarfile
 from pathlib import Path
 
@@ -89,3 +90,60 @@ def test_rollback_rejects_source_outside_project(tmp_path, monkeypatch):
     monkeypatch.setattr(remote, 'RELEASES', tmp_path / 'project/releases')
     with pytest.raises(remote.DeployError, match='invalid_previous_release'):
         remote.restore({'revision': SHA, 'previous': {'source': str(tmp_path), 'image': 'old'}})
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='Production transaction uses Linux file locks and symlinks')
+@pytest.mark.parametrize('failure', ['build', 'switch'])
+def test_failed_release_restores_previous_and_preserves_settings(tmp_path, monkeypatch, failure):
+    root = tmp_path / 'project'
+    root.mkdir()
+    (root / '.env').write_text('EXAMPLE=preserved\n')
+    monkeypatch.setattr(remote, 'ROOT', root)
+    monkeypatch.setattr(remote, 'STATE', root / 'deploy-state')
+    monkeypatch.setattr(remote, 'RELEASES', root / 'releases')
+    job = remote.STATE / SHA
+    job.mkdir(parents=True)
+    archive(tmp_path).replace(job / 'source.tar.gz')
+    remote.save_state({'revision': SHA, 'status': 'queued'})
+    calls = []
+    failed = False
+
+    def fake_command(args, **kwargs):
+        nonlocal failed
+        calls.append(args)
+        if args[:2] == ['docker', 'inspect']:
+            return 'legacy' if 'Labels' in args[3] else 'sha256:previous'
+        if args[:2] == ['docker', 'exec']:
+            return '0'
+        should_fail = 'build' in args if failure == 'build' else 'up' in args
+        if should_fail and not failed:
+            failed = True
+            raise remote.DeployError('simulated_failure')
+
+    def fake_backup(args, stdout, **kwargs):
+        stdout.write(b'backup' * 100)
+
+    monkeypatch.setattr(remote, 'command', fake_command)
+    monkeypatch.setattr(remote.subprocess, 'run', fake_backup)
+    with pytest.raises(remote.DeployError, match='deployment_failed'):
+        remote.run(SHA)
+    state = remote.load_state(SHA)
+    assert failed and state['status'] == 'rolled_back'
+    assert state['previous']['source'] == str(root)
+    assert (root / '.env').read_text() == 'EXAMPLE=preserved\n'
+    assert not (root / 'current').exists()
+    assert '--no-build' in calls[-1] and calls[-1][-2:] == ['bot', 'worker']
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='Production enqueue uses Linux file locks')
+def test_enqueue_does_not_wait_for_oneshot_completion(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, 'STATE', tmp_path / 'state')
+    monkeypatch.setattr(remote, 'INCOMING', tmp_path / 'incoming')
+    remote.INCOMING.mkdir()
+    archive(tmp_path).replace(remote.INCOMING / (SHA + '.tar.gz'))
+    calls = []
+    monkeypatch.setattr(remote, 'command', lambda args, **kwargs: calls.append(args))
+    assert remote.enqueue(SHA)['status'] == 'queued'
+    assert '--no-block' in calls[0]
+    assert '--property=TimeoutStartSec=1800' in calls[0]
+    assert any(arg.startswith('--property=ExecStopPost=') for arg in calls[0])
