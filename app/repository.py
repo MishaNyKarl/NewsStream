@@ -16,7 +16,6 @@ import unicodedata
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from uuid import uuid4
-from weakref import WeakKeyDictionary
 
 from sqlalchemy import delete, func, or_, select, text, update
 
@@ -26,7 +25,7 @@ from app.news_repository import NewsRepository
 from app.monitoring import INTENSIVE_DURATION, IntensiveSlotOccupied, completion_next, next_checkpoint
 from app.product_analytics import BUSINESS_EVENTS, ProductAnalyticsRepository, add_event
 
-_sqlite_locks = WeakKeyDictionary()
+from app.commerce import limits, _sqlite_locks
 _ADMISSION_LOCK = 419281701
 _LLM_BUDGET_LOCK = 419281702
 _LEASE = timedelta(minutes=15)
@@ -123,14 +122,20 @@ class Repository(NewsRepository, ProductAnalyticsRepository):
                 return story
             if story.monitoring_mode == "intensive":
                 return story  # Repeated taps do not restart the window.
-            current = next((item for item in stories if item.monitoring_mode == "intensive"), None)
+            policy = await limits(session, user_id, self.settings)
+            if policy['intensive_slots'] == 0:
+                raise UserError('Срочные наблюдения недоступны в вашем тарифе. Подробнее: /account')
+            occupied = [item for item in stories if item.monitoring_mode == 'intensive']
+            current = next((item for item in occupied if item.id == replace_story_id), None)
+            if len(occupied) >= policy['intensive_slots'] and current is None:
+                current = occupied[0]
             if current is not None and current.id != replace_story_id:
                 raise IntensiveSlotOccupied(current.id, current.title)
             if current is not None:
                 self._daily(current)
                 current.next_check_at = now + timedelta(hours=current.check_frequency_hours) if current.status == "active" else None
                 self._event(session, "intensive_transferred_from", user_id, current.id)
-            # Release the partial unique index before assigning the new topic.
+            # User row lock serializes the per-plan slot quota across processes.
             await session.flush()
             if story.status == "draft":
                 story.status = "active"
@@ -264,8 +269,9 @@ class Repository(NewsRepository, ProductAnalyticsRepository):
             await session.flush()
             count = await session.scalar(select(func.count()).select_from(Story).where(
                 Story.user_id == user_id, Story.status != "deleted"))
-            if count >= self.settings.max_stories_per_user:
-                raise UserError(f"Лимит — {self.settings.max_stories_per_user} наблюдений. Удалите ненужное и попробуйте снова.")
+            policy = await limits(session, user_id, self.settings)
+            if count >= policy["stories"]:
+                raise UserError(f"Лимит — {policy['stories']} наблюдений. Удалите ненужное и попробуйте снова.")
             story = Story(user_id=user_id, title=extraction.title, original_input=original_input,
                 original_url=original_url, summary=extraction.short_summary,
                 current_state=extraction.current_state, entities=extraction.entities,
@@ -353,12 +359,22 @@ class Repository(NewsRepository, ProductAnalyticsRepository):
                 return None
             if user_id is None and (story.next_check_at is None or story.next_check_at > now):
                 return None
+            policy = await limits(session, story.user_id, self.settings)
+            if story.monitoring_mode == 'intensive':
+                ids = list(await session.scalars(select(Story.id).where(Story.user_id == story.user_id,
+                    Story.monitoring_mode == 'intensive', Story.status.in_(('active', 'paused'))).order_by(Story.id)))
+                if story.id not in ids[:policy['intensive_slots']]:
+                    self._daily(story)
+                    story.next_check_at = now + timedelta(hours=story.check_frequency_hours)
+                    if not manual:
+                        return None
             if manual:
                 day = _day_start()
                 if user.manual_quota_day != day:
                     user.manual_quota_day = day
                     user.manual_checks_today = 0
-                if user.manual_checks_today >= self.settings.max_manual_checks_per_day:
+                policy = await limits(session, user_id, self.settings)
+                if user.manual_checks_today >= policy["manual_daily"]:
                     raise UserError("Лимит ручных проверок на сегодня исчерпан. Автоматические проверки продолжатся.")
                 last = user.last_manual_check_at
                 if last is not None and last + timedelta(seconds=self.settings.manual_check_cooldown_seconds) > now:
@@ -595,6 +611,13 @@ class Repository(NewsRepository, ProductAnalyticsRepository):
                 if story is None or story.status == "deleted":
                     story_id = user_id = None
                     request_id = None
+            if user_id is not None:
+                policy = await limits(session, user_id, self.settings)
+                user_calls = await session.scalar(select(func.count()).select_from(UsageEvent).where(
+                    UsageEvent.operation == 'llm_reserved', UsageEvent.user_id == user_id,
+                    UsageEvent.created_at >= _day_start()))
+                if user_calls >= policy['llm_daily']:
+                    return False
             self._event(session, "llm_reserved", user_id, story_id, request_id=request_id)
             return True
 

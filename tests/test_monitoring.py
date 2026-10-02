@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 
 from app.bot import parse_transfer, story_keyboard, story_text
 from app.domain import UserError
@@ -93,16 +92,12 @@ async def test_owner_is_required_and_quota_is_per_user(store, clock):
     assert (await repo.get_story(1, a.id)).monitoring_mode == "intensive"
 
 
-async def test_database_constraint_catches_bypassed_quota(store, clock):
-    repo, factory, _ = store
+async def test_dynamic_slot_quota_rejects_second_default_topic(store, clock):
+    repo, _, _ = store
     a, b = await active(repo), await active(repo)
     await repo.set_monitoring_mode(1, a.id, "intensive")
-    with pytest.raises(IntegrityError):
-        async with factory.begin() as session:
-            item = await session.get(Story, b.id)
-            item.monitoring_mode = "intensive"
-            item.intensive_started_at = START
-            item.intensive_until = START + timedelta(hours=24)
+    with pytest.raises(IntensiveSlotOccupied):
+        await repo.set_monitoring_mode(1, b.id, "intensive")
 
 
 async def test_pause_retains_slot_and_resume_does_not_restart_window(store, clock):

@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from app.ai.client import AIClient
+from app.commerce import Commerce, operation_key
 from app.config import Settings
 from app.content.fetcher import ContentFetcher
 from app.domain import Candidate, ProviderUnavailable, UserError
@@ -21,6 +22,7 @@ from app.search.planning import diverse_results, plan_queries, publisher, source
 from app.progress import CheckMetrics, CheckOutcome, progress_context, report
 
 log = logging.getLogger(__name__)
+credit_context: ContextVar[str | None] = ContextVar('credit_context', default=None)
 usage_context: ContextVar[dict] = ContextVar('usage_context', default={})
 
 def utc(value):
@@ -30,6 +32,7 @@ class BotService:
     def __init__(self, settings: Settings, repo=None, ai=None, search=None, fetcher=None):
         self.settings = settings
         self.repo = repo or Repository(settings)
+        self.commerce = Commerce(self.repo.session_factory, settings) if isinstance(self.repo, Repository) else None
         self.ai = ai or AIClient(settings, self._usage)
         self.search = search or SearchClient(settings, self._usage)
         self.fetcher = fetcher or ContentFetcher()
@@ -81,7 +84,8 @@ class BotService:
 
     async def is_admin(self, user_id):
         user = await self.repo.get_user(user_id)
-        return bool(user and (user.is_admin or user_id in self.settings.admin_ids))
+        inherited = bool(user and (user.is_admin or user_id in self.settings.admin_ids))
+        return await self.commerce.role(user_id, inherited) if self.commerce else inherited
 
     async def _require_user(self, user_id):
         if not await self.repo.get_user(user_id):
@@ -126,14 +130,26 @@ class BotService:
     async def prepare_story(self, user_id, text, progress=None, *, source_url=None, use_text=False,
                             news_id=None, news_token=None):
         token = progress_context.set(progress)
+        charge = None
+        credit_token = credit_context.set(None)
+        success = False
         try:
             async with asyncio.timeout(300):
-                return await self._prepare_story(user_id, text, source_url=source_url, use_text=use_text,
-                                                news_id=news_id, news_token=news_token)
+                await self._require_user(user_id)
+                if self.commerce:
+                    charge = await self.commerce.reserve(user_id, 'news', operation_key())
+                    credit_context.set(charge)
+                result = await self._prepare_story(user_id, text, source_url=source_url, use_text=use_text,
+                                                   news_id=news_id, news_token=news_token)
+                success = True
+                return result
         except TimeoutError:
             raise UserError('Подготовка заняла слишком много времени. Пришлите ссылку или описание ещё раз.') from None
         finally:
             progress_context.reset(token)
+            credit_context.reset(credit_token)
+            if charge:
+                await asyncio.shield(self.commerce.settle(user_id, charge, success))
 
     async def _prepare_story(self, user_id, text, *, source_url=None, use_text=False, news_id=None, news_token=None):
         await self._require_user(user_id)
@@ -145,7 +161,7 @@ class BotService:
         if user_id in self._creating:
             raise UserError('Ещё разбираю предыдущее сообщение. Подождите немного.')
         self._creating.add(user_id)
-        ctx = usage_context.set({'user_id': user_id, 'request_id': uuid4().hex})
+        ctx = usage_context.set({'user_id': user_id, 'request_id': credit_context.get() or uuid4().hex})
         try:
             await self.repo.record_usage('story_input_received', user_id=user_id)
             # Only public forwarded-post references are accepted as provenance.
@@ -374,13 +390,16 @@ class BotService:
 
     async def check_story(self, story, progress=None):
         started = time.monotonic()
-        ctx = usage_context.set({'user_id': story.user_id, 'story_id': story.id, 'request_id': uuid4().hex})
+        ctx = usage_context.set({'user_id': story.user_id, 'story_id': story.id, 'request_id': story.lock_token or uuid4().hex})
         progress_token = progress_context.set(progress)
         metrics = CheckMetrics()
         candidates = []
         outcome = CheckOutcome('error', message='Не удалось завершить проверку. Попробуйте позже.')
         failed = False
+        charge = None
         try:
+            if self.commerce:
+                charge = await self.commerce.reserve(story.user_id, 'check', story.lock_token)
             await report('queued')
             async with self._checks:
                 async with asyncio.timeout(600):
@@ -439,7 +458,48 @@ class BotService:
             finally:
                 usage_context.reset(ctx)
                 progress_context.reset(progress_token)
+                if charge:
+                    await asyncio.shield(self.commerce.settle(story.user_id, charge,
+                        not failed and outcome.status not in {'error', 'cancelled'}))
         return outcome
+
+    async def account_text(self, user_id):
+        import html
+        value = await self.commerce.snapshot(user_id)
+        account, p = value['account'], value['limits']
+        return (f"<b>Тариф: {html.escape(p['name'])}</b>\n"
+                f"Баланс: {account.balance if account else 0} кредитов\n"
+                f"Наблюдений: {p['stories']}; срочных одновременно: {p['intensive_slots']}\n"
+                f"Ручных проверок в сутки UTC: {p['manual_daily']}\n"
+                f"Обсуждение: {'доступно' if p['discussion'] else 'недоступно'}\n"
+                f"Разбор новости: {p['news_credits']} кр.; проверка: {p['check_credits']} кр.; "
+                f"ответ в обсуждении: {p['discussion_credits']} кр.\n\n"
+                "Проверки по расписанию тоже расходуют кредиты. Проверка без новых фактов оплачивается, "
+                "если завершилась; при ошибке кредиты возвращаются. "
+                "Пополнение и смена тарифа — через администратора. Автоматическое продление пока не подключено.")
+
+    async def discuss(self, user_id, story_id, question):
+        story = await self.repo.get_story(user_id, story_id)
+        if not story:
+            raise UserError('Наблюдение недоступно.')
+        if not 3 <= len(question.strip()) <= 2000:
+            raise UserError('Вопрос должен содержать от 3 до 2000 символов.')
+        if not self.provider_ready():
+            raise UserError('Обсуждение временно недоступно.')
+        key = operation_key()
+        charge = await self.commerce.reserve(user_id, 'discussion', key)
+        context = usage_context.set({'user_id': user_id, 'story_id': story_id, 'request_id': key})
+        success = False
+        try:
+            async with asyncio.timeout(120):
+                updates = await self.repo.recent_updates(user_id, story_id)
+                answer = await self.ai.discuss({'title': story.title, 'current_state': story.current_state,
+                    'updates': [u.summary for u in updates[:5]], 'question': question.strip()})
+                success = True
+                return answer
+        finally:
+            usage_context.reset(context)
+            await asyncio.shield(self.commerce.settle(user_id, charge, success))
 
     async def _error(self, operation, exc, **context):
         # Exception strings may contain a request URL, headers or user content.

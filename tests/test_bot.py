@@ -272,13 +272,13 @@ async def test_confirmation_and_cancel_use_owned_service_operations():
 
 
 @pytest.mark.asyncio
-async def test_feedback_and_future_placeholder():
+async def test_feedback_and_discussion_entry():
     harness = Harness()
     await harness.callback("not_useful:12")
     harness.service.give_feedback.assert_awaited_once_with(100, 12, "not_useful")
     harness.reset_throttle()
     await harness.callback("chat:11")
-    assert "следующей версии" in harness.text
+    assert "/discuss 11" in harness.text and "/account" in harness.text
 
 
 @pytest.mark.asyncio

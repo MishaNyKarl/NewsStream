@@ -433,3 +433,52 @@ async def test_product_analytics_requires_coverage_marker(admin):
     await login(client)
     assert 'ещё не собирается' in (await client.get('/analytics')).text
     assert (await client.get('/analytics.csv')).status_code == 400
+
+async def test_commerce_csrf_writes_and_audited_idempotency(admin):
+    from app.models import Account, CreditEntry
+    client, _, data, *_ = admin
+    async with data.sessions.begin() as session:
+        session.add(User(telegram_id=456))
+    assert (await client.get('/commerce')).status_code == 303
+    await login(client)
+    page = await client.get('/commerce?user=456')
+    assert page.status_code == 200
+    payload = dict(csrf=csrf(page), key=str(uuid.uuid4()), action='grant', user_id='456', amount='50', reason='Test bonus')
+    assert (await client.post('/commerce', data=payload | {'csrf':'bad'})).status_code == 403
+    assert (await client.post('/commerce', data=payload)).status_code == 303
+    assert (await client.post('/commerce', data=payload)).status_code == 303
+    async with data.sessions() as session:
+        assert (await session.get(Account, 456)).balance == 50
+        assert len(list(await session.scalars(select(CreditEntry)))) == 1
+
+
+async def test_web_roles_deny_forged_posts_and_revoke_sessions(admin, password_hash):
+    client, app, *_ = admin
+    app.state.set_web_account('viewer-test', password_hash, 'viewer', True, 'admin')
+    page = await client.get('/login')
+    response = await client.post('/login', data=dict(csrf=csrf(page), username='viewer-test', password=PASSWORD))
+    assert response.status_code == 303
+    assert (await client.get('/commerce')).status_code == 200
+    assert (await client.get('/access')).status_code == 403
+    assert (await client.post('/commerce', data={'action':'grant'})).status_code == 403
+    assert (await client.post('/restart', data={})).status_code == 403
+    app.state.set_web_account('viewer-test', None, 'viewer', False, 'admin')
+    assert (await client.get('/')).status_code == 303
+
+
+async def test_finance_cannot_assign_admin_privileges(admin, password_hash):
+    client, app, *_ = admin
+    app.state.set_web_account('finance-test', password_hash, 'finance', True, 'admin')
+    page = await client.get('/login')
+    await client.post('/login', data=dict(csrf=csrf(page), username='finance-test', password=PASSWORD))
+    page = await client.get('/commerce')
+    assert (await client.post('/commerce', data=dict(csrf=csrf(page), action='account'))).status_code == 403
+    assert (await client.post('/access', data={})).status_code == 403
+
+async def test_old_single_owner_release_rejects_delegated_session_on_rollback(admin, password_hash):
+    client, app, _, _, config = admin
+    app.state.set_web_account('rollback-viewer', password_hash, 'viewer', True, 'admin')
+    page = await client.get('/login')
+    await client.post('/login', data=dict(csrf=csrf(page), username='rollback-viewer', password=PASSWORD))
+    old_state = State(config.state_path, config.username+config.password_hash)
+    assert old_state.session(client.cookies.get(COOKIE), 28800, 1800) is None

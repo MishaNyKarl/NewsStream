@@ -9,6 +9,7 @@ from sqlalchemy import delete, func, or_, select
 from app.domain import InterestSaveResult, StoryExtraction, UserError
 from app.models import Story, User, UserInterest, UserNews, utcnow
 from app.product_analytics import add_event
+from app.commerce import limits
 
 
 class NewsRepository:
@@ -98,7 +99,8 @@ class NewsRepository:
                 return existing
             count = await db.scalar(select(func.count()).select_from(Story).where(
                 Story.user_id == user_id, Story.status != 'deleted'))
-            if count >= self.settings.max_stories_per_user:
+            policy = await limits(db, user_id, self.settings)
+            if count >= policy["stories"]:
                 raise UserError('Лимит наблюдений достигнут. Освободите место; сама новость сохранена в «Новости пользователя».')
             parsed = StoryExtraction.model_validate(item.parsed_data)
             story = Story(user_id=user_id, title=parsed.title, original_input=item.original_text,

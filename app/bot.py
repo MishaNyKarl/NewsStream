@@ -164,7 +164,7 @@ def story_text(story: Any) -> str:
     intensive = getattr(story, "monitoring_mode", "daily") == "intensive"
     schedule = (INTENSIVE_HELP + f"\nРежим до: {_date(story.intensive_until)}"
                 if intensive else f"Проверка каждые {int(story.check_frequency_hours)} ч.\n"
-                "В тесте можно выбрать одну тему для режима «Следить внимательнее».")
+                "Количество срочных наблюдений зависит от тарифа: /account.")
     if story.status == "paused":
         schedule += "\nПроверки приостановлены."
         if intensive:
@@ -470,7 +470,7 @@ def build_router(service: Any, settings: Any) -> Router:
             rows.append([_button(f"{icon} {story.id}. {title}", action, story.id)])
         lines.append("\nНажмите на наблюдение. Чтобы добавить новое, просто пришлите ссылку или текст.")
         focused = next((item for item in stories if getattr(item, "monitoring_mode", "daily") == "intensive"), None)
-        lines.append("\n⚡ В тесте — одна тема с частыми проверками. " + (
+        lines.append("\n⚡ Лимит срочных тем — в /account. " + (
             f"Сейчас: №{focused.id}. Режим можно перенести в карточке другой темы." if focused else "Сейчас место свободно."))
         rows.append([_button("⭐ Мои интересы", "interests", 0)])
         rows.append([InlineKeyboardButton(text="🗂 Журнал уведомлений", callback_data="jp:week")])
@@ -600,7 +600,7 @@ def build_router(service: Any, settings: Any) -> Router:
             "Например: «Когда откроют новую станцию метро и изменились ли сроки?»\n\n"
             "Можно выбрать «⭐ Просто интересна тема» — запомню интерес для будущих подборок без запуска наблюдения.\n\n"
             "Все присланные новости сохраню в «Новости пользователя». Когда карточка будет готова, пришлю отдельное сообщение.\n\n"
-            "Новости — /news · Ваши сюжеты — /watching · Журнал — /journal · Мои интересы — /interests · Помощь — /help" + ready,
+            "Тариф и баланс — /account · Новости — /news · Ваши сюжеты — /watching · Журнал — /journal · Мои интересы — /interests · Помощь — /help" + ready,
             main_keyboard())
 
     @router.message(Command("help"), ~F.forward_origin)
@@ -800,7 +800,7 @@ def build_router(service: Any, settings: Any) -> Router:
                     replace_story_id=transfer[1] if transfer else None)
             except IntensiveSlotOccupied as exc:
                 await _answer(message,
-                    "⚡ В тесте — <b>одна тема с частыми проверками</b>.\n\n"
+                    "⚡ <b>Слоты срочных наблюдений заняты</b>.\n\n"
                     f"Сейчас это «{escaped(exc.title, 180)}». Перенести режим на выбранную тему? "
                     "Прежняя тема вернётся к обычному расписанию; если она на паузе, пауза сохранится.\n\n" + INTENSIVE_HELP,
                     _keyboard([InlineKeyboardButton(text="⚡ Перенести режим", callback_data=f"transfer:{object_id}:{exc.story_id}")],
@@ -839,7 +839,9 @@ def build_router(service: Any, settings: Any) -> Router:
             await query.answer("Наблюдение больше недоступно. Откройте /watching.", show_alert=True)
             return
         if action == "chat":
-            await query.answer("Обсуждение сюжета появится в следующей версии. Пока доступны наблюдение, источники и история.", show_alert=True)
+            await query.answer()
+            await _answer(message, f'Чтобы обсудить эту новость, отправьте:\n/discuss {story.id} ваш вопрос\n\n'
+                'Ответ опирается на сохранённую новость, без нового поиска. Доступ и цена: /account.')
             return
         await query.answer()
         if action == "story":
@@ -870,6 +872,19 @@ def build_router(service: Any, settings: Any) -> Router:
                 await _answer(message, f"🕒 <b>Последние обновления</b>\n{escaped(story.title, 180)}")
                 for update in updates[:5]:
                     await _answer(message, _date(update.created_at) + "\n\n" + notification_text(story, update), notification_keyboard(story, update))
+
+    @router.message(Command('account'), ~F.forward_origin)
+    async def account_command(message: Message):
+        await _answer(message, await service.account_text(message.from_user.id))
+
+    @router.message(Command('discuss'), ~F.forward_origin)
+    async def discuss_command(message: Message):
+        parts = (message.text or '').split(maxsplit=2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            await _answer(message, 'Формат: /discuss ID_наблюдения ваш вопрос. Список: /watching')
+            return
+        answer = await service.discuss(message.from_user.id, int(parts[1]), parts[2])
+        await _answer(message, escaped(answer, 2800))
 
     @router.message(F.text.startswith("/"), ~F.forward_origin)
     async def unknown_command(message: Message) -> None:

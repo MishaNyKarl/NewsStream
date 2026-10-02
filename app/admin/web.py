@@ -4,6 +4,8 @@ from datetime import datetime
 import hmac
 import csv
 import io
+from types import SimpleNamespace
+from uuid import uuid4
 from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlsplit
@@ -26,11 +28,15 @@ from app.admin.ops import Ops
 from app.admin.password import HASHER
 from app.admin.state import State
 from app.admin.product import report as product_report
+from app.commerce import Commerce
+from app.errors import UserError
 
 COOKIE = '__Host-newswatch-admin'
 ROOT = Path(__file__).parent
 TITLES = {'/': 'Обзор', '/users': 'Пользователи', '/stories': 'Наблюдения', '/costs': 'Расходы LLM',
           '/analytics': 'Аналитика продукта',
+          '/commerce': 'Тарифы и кредиты',
+          '/access': 'Доступ к панели',
           '/checks': 'Проверки', '/errors': 'Ошибки', '/notifications': 'Уведомления',
           '/calculator': 'Калькулятор', '/project': 'Проект и сервер', '/docs': 'Документация', '/audit': 'Журнал действий'}
 
@@ -86,6 +92,12 @@ class Security:
             response = (RedirectResponse('/login', 303) if scope['method'] in {'GET', 'HEAD'}
                         else PlainTextResponse('Требуется вход', 401))
             return await response(scope, receive, secured_send)
+        role = (session or {}).get('role', 'owner')
+        if not public and request.url.path == '/access' and role != 'owner':
+            return await PlainTextResponse('Только владелец панели', 403)(scope, receive, secured_send)
+        if not public and scope['method'] == 'POST' and request.url.path != '/logout':
+            if role == 'viewer' or (role == 'finance' and request.url.path != '/commerce'):
+                return await PlainTextResponse('Недостаточно прав', 403)(scope, receive, secured_send)
         if scope['method'] == 'POST':
             if request.headers.get('origin') != self.config.origin:
                 return await PlainTextResponse('Недопустимый источник запроса', 403)(scope, receive, secured_send)
@@ -96,8 +108,13 @@ class Security:
 
 def create_app(config=None, data=None, ops=None):
     config = config or Config.from_env()
-    state = State(config.state_path, config.username+config.password_hash)
+    # Separate authentication generation: rolling back to the old single-owner
+    # code must invalidate delegated sessions instead of treating them as owner.
+    state = State(config.state_path, config.username+config.password_hash+'|rbac-v1')
     data = data or Data(config.database_url)
+    commerce_data = Data(config.database_url, commerce_write=True)
+    commerce = Commerce(commerce_data.sessions, SimpleNamespace(
+        max_stories_per_user=10, max_manual_checks_per_day=5, llm_daily_call_limit=250))
     ops = ops or Ops(config.ops_socket)
     login_lock = asyncio.Lock()  # At most one 64 MiB Argon2 operation in flight.
     templates = Environment(loader=FileSystemLoader(ROOT/'templates'), autoescape=select_autoescape())
@@ -109,9 +126,14 @@ def create_app(config=None, data=None, ops=None):
         f'{v/86400:.1f} дн.' if v >= 86400 else f'{v/3600:.1f} ч' if v >= 3600 else f'{v/60:.1f} мин')
     templates.filters['percent'] = lambda v: '—' if v is None else f'{v:.1f}%'
 
+    def actor(request):
+        return request.state.admin_session.get('principal', config.username)
+
     def render(request, template, status=200, **context):
         session = request.state.admin_session
-        context.update(request=request, title=TITLES.get(request.url.path, 'NewsStream'), nav=TITLES,
+        role = (session or {}).get('role', 'owner')
+        nav = {path: title for path, title in TITLES.items() if path != '/access' or role == 'owner'}
+        context.update(request=request, title=TITLES.get(request.url.path, 'NewsStream'), nav=nav, web_role=role,
                        csrf=session['csrf'] if session else '', authenticated=bool(session and session['authenticated']))
         return HTMLResponse(templates.get_template(template).render(**context), status_code=status)
 
@@ -152,24 +174,29 @@ def create_app(config=None, data=None, ops=None):
         if not state.admit_login(ip):
             return render(request, 'login.html', status=429, error='Слишком много попыток. Подождите 15 минут.')
         password = values.get('password', '')
+        username = values.get('username', '')
+        delegated = state.web_account(username) if username != config.username else None
+        password_hash = delegated['password_hash'] if delegated else config.password_hash
         valid = False
         if len(password) <= 1024:
             async with login_lock:
                 try:
-                    valid = await run_in_threadpool(HASHER.verify, config.password_hash, password)
+                    valid = await run_in_threadpool(HASHER.verify, password_hash, password)
                 except VerificationError:
                     pass
-        valid = valid and hmac.compare_digest(values.get('username', '').encode(), config.username.encode())
-        state.audit(config.username, 'login', result='ok' if valid else 'denied')
+        valid = valid and (delegated is not None or hmac.compare_digest(username.encode(), config.username.encode()))
+        state.audit(username[:80], 'login', result='ok' if valid else 'denied')
         if not valid:
             return render(request, 'login.html', status=401, error='Неверный логин или пароль.')
         token, _ = state.new_session(True, request.cookies.get(COOKIE))
+        if delegated:
+            state.bind_principal(token, username, password_hash)
         return cookie(RedirectResponse('/', 303), token)
 
     async def logout(request):
         await form(request)
         state.logout(request.cookies.get(COOKIE, ''))
-        state.audit(config.username, 'logout')
+        state.audit(actor(request), 'logout')
         response = RedirectResponse('/login', 303)
         response.delete_cookie(COOKIE, path='/', secure=True, httponly=True, samesite='strict')
         return response
@@ -207,7 +234,7 @@ def create_app(config=None, data=None, ops=None):
             raw = await form(request)
             try:
                 values = validate(raw)
-                state.save_calculator(values, config.username)
+                state.save_calculator(values, actor(request))
                 return RedirectResponse('/calculator', 303)
             except ValueError as exc:
                 values, error, status = {k: raw.get(k, '') for k in FIELDS}, str(exc), 400
@@ -234,7 +261,7 @@ def create_app(config=None, data=None, ops=None):
                         display(row['last_action']), row['billing']['confirmed'], row['billing']['estimated'],
                         row['billing']['unknown_calls'], filters.start.isoformat(), result['cutoff'].isoformat(),
                         result['coverage'].isoformat()])
-                state.audit(config.username, 'analytics_export', result='ok')
+                state.audit(actor(request), 'analytics_export', result='ok')
                 return Response('\ufeff'+stream.getvalue(), media_type='text/csv; charset=utf-8',
                                 headers={'Content-Disposition': 'attachment; filename="newsstream-analytics.csv"'})
             start = (filters.page-1)*50
@@ -271,7 +298,7 @@ def create_app(config=None, data=None, ops=None):
         if (target not in {'bot', 'worker'} or not config.ops_socket
                 or values.get('confirm') != f'ПЕРЕЗАПУСТИТЬ {target}'):
             raise HTTPException(400, 'Подтверждение не совпадает')
-        if not state.consume(values.get('nonce', ''), request.state.admin_session['id'], target, config.username):
+        if not state.consume(values.get('nonce', ''), request.state.admin_session['id'], target, actor(request)):
             raise HTTPException(409, 'Подтверждение уже использовано или истекло. Сначала проверьте состояние сервиса.')
         result = await ops.restart(target, values['nonce'])
         code = result.get('result')
@@ -283,7 +310,7 @@ def create_app(config=None, data=None, ops=None):
                     'started': 'Операция уже принята. Проверьте состояние сервиса.'}
         if code not in messages:
             code = 'unknown'
-        state.audit(config.username, 'restart_result', target, code)
+        state.audit(actor(request), 'restart_result', target, code)
         return render(request, 'message.html', message=messages[code], request_id=values['nonce'])
 
     async def docs(request):
@@ -314,15 +341,57 @@ def create_app(config=None, data=None, ops=None):
     async def health(request):
         return PlainTextResponse('ok')  # Process liveness only, no public operational data.
 
+    async def commerce_page(request):
+        try:
+            if request.method == 'POST':
+                values = await form(request)
+                if request.state.admin_session.get('role') == 'finance' and values.get('action') not in {
+                        'grant', 'set_balance', 'topup', 'paid', 'cancel', 'refund_stale'}:
+                    raise HTTPException(403, 'Эта роль управляет только балансом и пополнениями.')
+                await commerce.command(values.get('action'), values, actor(request), values.get('key', ''))
+                state.audit(actor(request), 'commerce_change', result='ok')
+                uid = values.get('user_id', '')
+                return RedirectResponse('/commerce'+('?user='+str(int(uid)) if uid else ''), 303)
+            uid = int(request.query_params['user']) if request.query_params.get('user') else None
+            if uid is not None and not 0 < uid < 2**63:
+                raise ValueError
+            result = await commerce.dashboard(uid)
+            return render(request, 'commerce.html', result=result, key=lambda: str(uuid4()))
+        except UserError as exc:
+            return render(request, 'message.html', status=400, message=str(exc))
+        except ValueError:
+            return render(request, 'message.html', status=400, message='Некорректное число. Вернитесь и проверьте поля.')
+
+    async def access_page(request):
+        if request.method == 'POST':
+            values = await form(request)
+            username, password = values.get('username', ''), values.get('password', '')
+            role = values.get('role')
+            if not re.fullmatch(r'[a-zA-Z0-9_.-]{3,40}', username) or username == config.username:
+                raise HTTPException(400, 'Логин: 3–40 латинских букв, цифр, _, . или -. Учётная запись владельца защищена.')
+            if role not in {'viewer', 'finance', 'admin'} or (password and not 16 <= len(password) <= 200):
+                raise HTTPException(400, 'Выберите роль. Новый пароль — от 16 до 200 символов.')
+            async with login_lock:
+                password_hash = await run_in_threadpool(HASHER.hash, password) if password else None
+            try:
+                state.set_web_account(username, password_hash, role, values.get('enabled') == '1', actor(request))
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from None
+            return RedirectResponse('/access', 303)
+        return render(request, 'access.html', accounts=state.web_accounts())
+
     @asynccontextmanager
     async def lifespan(app):
         yield
         await data.close()
+        await commerce_data.close()
 
     routes = [Route('/login', login, methods=['GET', 'POST']), Route('/logout', logout, methods=['POST']),
               Route('/healthz', health), Route('/calculator', calculator, methods=['GET', 'POST']),
               Route('/project', project), Route('/restart/prepare', restart_prepare, methods=['POST']),
               Route('/analytics', analytics), Route('/analytics.csv', analytics),
+              Route('/commerce', commerce_page, methods=['GET', 'POST']),
+              Route('/access', access_page, methods=['GET', 'POST']),
               Route('/restart', restart, methods=['POST']), Route('/docs', docs), Route('/audit', audit),
               Mount('/static', StaticFiles(directory=ROOT/'static'), name='static')]
     routes += [Route(path, dashboard) for path in ('/', '/users', '/stories', '/costs', '/checks', '/errors', '/notifications')]

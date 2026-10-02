@@ -51,7 +51,7 @@ class Story(Base):
         CheckConstraint("check_frequency_hours > 0", name="ck_story_frequency"),
         CheckConstraint("monitoring_mode IN ('daily','intensive')", name="ck_story_monitoring_mode"),
         CheckConstraint("monitoring_mode != 'intensive' OR (intensive_started_at IS NOT NULL AND intensive_until IS NOT NULL)", name="ck_story_intensive_dates"),
-        Index("uq_stories_user_intensive", "user_id", unique=True,
+        Index("ix_stories_user_intensive", "user_id",
               postgresql_where=text("monitoring_mode = 'intensive' AND status IN ('active','paused')"),
               sqlite_where=text("monitoring_mode = 'intensive' AND status IN ('active','paused')")),
         Index("ix_stories_due", "status", "next_check_at"),
@@ -224,3 +224,89 @@ class AnalyticsState(Base):
     __tablename__ = 'analytics_state'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     started_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
+
+
+class Plan(Base):
+    __tablename__ = 'plans'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    experiment: Mapped[str] = mapped_column(String(80), default='')
+    price_minor: Mapped[int] = mapped_column(Integer, default=0)
+    period_days: Mapped[int] = mapped_column(Integer, default=30)
+    currency: Mapped[str] = mapped_column(String(3), default='RUB')
+    stories: Mapped[int] = mapped_column(Integer)
+    manual_daily: Mapped[int] = mapped_column(Integer)
+    llm_daily: Mapped[int] = mapped_column(Integer)
+    intensive_slots: Mapped[int] = mapped_column(Integer, default=1)
+    discussion: Mapped[bool] = mapped_column(Boolean, default=False)
+    discussion_credits: Mapped[int] = mapped_column(Integer, default=0)
+    news_credits: Mapped[int] = mapped_column(Integer, default=0)
+    check_credits: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class Account(Base):
+    __tablename__ = 'accounts'
+    __table_args__ = (CheckConstraint('balance >= 0 AND balance <= 1000000000', name='ck_account_balance'),)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.telegram_id'), primary_key=True)
+    balance: Mapped[int] = mapped_column(BigInteger, default=0)
+    plan_id: Mapped[int | None] = mapped_column(ForeignKey('plans.id'))
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    role: Mapped[str] = mapped_column(String(16), default='inherit')
+    credit_exempt: Mapped[bool] = mapped_column(Boolean, default=False)
+    stories_override: Mapped[int | None] = mapped_column(Integer)
+    manual_override: Mapped[int | None] = mapped_column(Integer)
+    llm_override: Mapped[int | None] = mapped_column(Integer)
+    intensive_override: Mapped[int | None] = mapped_column(Integer)
+    discussion_override: Mapped[bool | None] = mapped_column(Boolean)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class CreditEntry(Base):
+    __tablename__ = 'credit_entries'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.telegram_id'), index=True)
+    key: Mapped[str] = mapped_column(String(100), unique=True)
+    delta: Mapped[int] = mapped_column(BigInteger)
+    balance_after: Mapped[int] = mapped_column(BigInteger)
+    kind: Mapped[str] = mapped_column(String(24))
+    actor: Mapped[str] = mapped_column(String(80))
+    reason: Mapped[str] = mapped_column(String(240))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class Charge(Base):
+    __tablename__ = 'charges'
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.telegram_id'), index=True)
+    plan_id: Mapped[int | None] = mapped_column(ForeignKey('plans.id'))
+    operation: Mapped[str] = mapped_column(String(16))
+    amount: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default='reserved')
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+class TopUp(Base):
+    __tablename__ = 'topups'
+    plan_id: Mapped[int | None] = mapped_column(ForeignKey('plans.id'))
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.telegram_id'), index=True)
+    credits: Mapped[int] = mapped_column(Integer)
+    amount_minor: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(3))
+    status: Mapped[str] = mapped_column(String(16), default='pending')
+    reference: Mapped[str | None] = mapped_column(String(120), unique=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    paid_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+class CommerceAudit(Base):
+    __tablename__ = 'commerce_audit'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(100), unique=True)
+    actor: Mapped[str] = mapped_column(String(80))
+    user_id: Mapped[int | None] = mapped_column(ForeignKey('users.telegram_id'))
+    action: Mapped[str] = mapped_column(String(32))
+    detail: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

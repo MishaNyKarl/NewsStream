@@ -1,3 +1,4 @@
+from app.errors import UserError as UserError
 from dataclasses import dataclass
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
@@ -70,8 +71,6 @@ class Candidate:
     published_at: datetime | None = None
     full_text: bool = True
 
-class UserError(Exception):
-    pass
 
 
 @dataclass

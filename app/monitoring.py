@@ -9,7 +9,7 @@ INTENSIVE_DURATION = timedelta(hours=24)
 
 class IntensiveSlotOccupied(UserError):
     def __init__(self, story_id, title):
-        super().__init__("В тесте внимательно отслеживается только одна тема на пользователя.")
+        super().__init__("Все слоты срочных наблюдений вашего тарифа заняты.")
         self.story_id = story_id
         self.title = title
 

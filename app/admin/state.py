@@ -36,6 +36,10 @@ class State:
                     id TEXT PRIMARY KEY, session TEXT NOT NULL, target TEXT NOT NULL,
                     expires REAL NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS web_accounts (
+                    username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL, enabled INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS session_principals (
+                    session TEXT PRIMARY KEY, username TEXT NOT NULL, revision TEXT NOT NULL);
             ''')
         path.chmod(0o600)
 
@@ -65,13 +69,48 @@ class State:
                        (now - absolute, now - idle, self.credential))
             row = db.execute('SELECT * FROM sessions WHERE id=?', (digest(token),)).fetchone()
             if row:
+                principal = db.execute('SELECT * FROM session_principals WHERE session=?', (row['id'],)).fetchone()
+                extra = {}
+                if principal:
+                    account = db.execute('SELECT * FROM web_accounts WHERE username=?', (principal['username'],)).fetchone()
+                    if not account or not account['enabled'] or digest(account['password_hash']) != principal['revision']:
+                        db.execute('DELETE FROM sessions WHERE id=?', (row['id'],))
+                        return None
+                    extra = {'principal': account['username'], 'role': account['role']}
                 db.execute('UPDATE sessions SET touched=? WHERE id=?', (now, row['id']))
-                return dict(row)
+                return dict(row) | extra
+
+    def web_account(self, username):
+        with self.db() as db:
+            row = db.execute('SELECT * FROM web_accounts WHERE username=? AND enabled=1', (username,)).fetchone()
+            return dict(row) if row else None
+
+    def web_accounts(self):
+        with self.db() as db:
+            return [dict(r) for r in db.execute('SELECT username,role,enabled FROM web_accounts ORDER BY username')]
+
+    def set_web_account(self, username, password_hash, role, enabled, actor):
+        with self.db() as db:
+            existing = db.execute('SELECT * FROM web_accounts WHERE username=?', (username,)).fetchone()
+            if existing and not password_hash:
+                password_hash = existing['password_hash']
+            if not password_hash:
+                raise ValueError('Для нового аккаунта задайте пароль.')
+            db.execute('INSERT INTO web_accounts VALUES(?,?,?,?) ON CONFLICT(username) DO UPDATE SET '
+                       'password_hash=excluded.password_hash,role=excluded.role,enabled=excluded.enabled',
+                       (username, password_hash, role, int(enabled)))
+            db.execute('DELETE FROM sessions WHERE id IN (SELECT session FROM session_principals WHERE username=?)', (username,))
+            self._audit(db, actor, 'web_account_changed', username, role if enabled else 'disabled')
+
+    def bind_principal(self, token, username, password_hash):
+        with self.db() as db:
+            db.execute('INSERT INTO session_principals VALUES(?,?,?)', (digest(token), username, digest(password_hash)))
 
     def new_session(self, authenticated=False, old_token=None):
         token, csrf, now = secrets.token_urlsafe(32), secrets.token_urlsafe(32), time.time()
         with self.db() as db:
             db.execute('DELETE FROM sessions WHERE created < ? OR credential != ?', (now-86400, self.credential))
+            db.execute('DELETE FROM session_principals WHERE session NOT IN (SELECT id FROM sessions)')
             if old_token:
                 db.execute('DELETE FROM sessions WHERE id=?', (digest(old_token),))
             # Bound anonymous state even under repeated GET /login traffic.

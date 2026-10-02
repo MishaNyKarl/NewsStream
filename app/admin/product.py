@@ -7,7 +7,7 @@ from statistics import median
 from sqlalchemy import case, func, select
 
 from app.admin.data import MSK
-from app.models import AnalyticsState, ProductEvent, UsageEvent, User, utcnow
+from app.models import Account, AnalyticsState, ProductEvent, UsageEvent, User, utcnow
 
 SESSION_GAP = timedelta(minutes=30)
 MAX_EVENTS = 25_000
@@ -178,9 +178,11 @@ async def report(data, filters, include_admins=False):
         coverage = await session.scalar(select(AnalyticsState.started_at).where(AnalyticsState.id == 1))
         if coverage is None:
             return {'unavailable': True}
-        uq = select(User.telegram_id, User.created_at, User.is_admin).where(User.created_at < cutoff)
+        admin_flag = case((Account.role == 'admin', True), (Account.role == 'user', False), else_=User.is_admin)
+        uq = select(User.telegram_id, User.created_at, admin_flag.label('is_admin')).outerjoin(
+            Account, Account.user_id == User.telegram_id).where(User.created_at < cutoff)
         if not include_admins:
-            uq = uq.where(User.is_admin.is_(False))
+            uq = uq.where(admin_flag.is_(False))
         if filters.user:
             uq = uq.where(User.telegram_id == filters.user)
         user_rows = (await session.execute(uq.limit(10001))).mappings().all()
@@ -190,15 +192,15 @@ async def report(data, filters, include_admins=False):
         # Keep queries bounded, but reject rather than publish silently truncated metrics.
         since = filters.start-timedelta(days=30)
         query = select(ProductEvent.id, ProductEvent.user_id, ProductEvent.event, ProductEvent.created_at).join(
-            User, User.telegram_id == ProductEvent.user_id).where(ProductEvent.created_at >= since,
+            User, User.telegram_id == ProductEvent.user_id).outerjoin(Account, Account.user_id == User.telegram_id).where(ProductEvent.created_at >= since,
             ProductEvent.created_at < cutoff)
         costs_query = select(UsageEvent.user_id, UsageEvent.request_id, UsageEvent.created_at,
             UsageEvent.cost_source, UsageEvent.currency, UsageEvent.actual_cost, UsageEvent.estimated_cost,
-            UsageEvent.provider, UsageEvent.model).join(User, User.telegram_id == UsageEvent.user_id).where(
+            UsageEvent.provider, UsageEvent.model).join(User, User.telegram_id == UsageEvent.user_id).outerjoin(Account, Account.user_id == User.telegram_id).where(
             UsageEvent.operation == 'llm', UsageEvent.created_at >= filters.start, UsageEvent.created_at < cutoff)
         if not include_admins:
-            query = query.where(User.is_admin.is_(False))
-            costs_query = costs_query.where(User.is_admin.is_(False))
+            query = query.where(admin_flag.is_(False))
+            costs_query = costs_query.where(admin_flag.is_(False))
         if filters.user:
             query = query.where(User.telegram_id == filters.user)
             costs_query = costs_query.where(UsageEvent.user_id == filters.user)

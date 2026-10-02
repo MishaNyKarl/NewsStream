@@ -69,12 +69,12 @@ def identifier(value):
 
 
 class Data:
-    def __init__(self, url):
+    def __init__(self, url, commerce_write=False):
         options = {}
         if url.startswith('postgresql'):
             options = {'pool_size': 2, 'max_overflow': 0, 'pool_timeout': 5,
                        'connect_args': {'timeout': 5, 'command_timeout': 8, 'server_settings': {
-                           'default_transaction_read_only': 'on', 'statement_timeout': '7000',
+                           'default_transaction_read_only': 'off' if commerce_write else 'on', 'statement_timeout': '7000',
                            'application_name': 'newswatch-admin', 'timezone': 'UTC'}}}
         self.engine = create_async_engine(url, echo=False, pool_pre_ping=True, **options)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
