@@ -56,6 +56,11 @@ jobs:
           if [ -d admin_ops ]; then python -m ruff check admin_ops; fi
       - name: Full PostgreSQL tests
         run: python -m pytest -q
+      - name: Migrations on a clean test database
+        run: |
+          cp .env.example .env
+          DATABASE_URL="$NEWSWATCH_TEST_DATABASE_URL" python -m alembic upgrade head
+          DATABASE_URL="$NEWSWATCH_TEST_DATABASE_URL" python -m alembic check
       - name: Validate deployment package
         run: |
           python deploy/package.py /tmp/newsstream-release.tar.gz

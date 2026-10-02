@@ -12,6 +12,6 @@ install -d -m 0755 /opt/newswatch-admin-ops
 install -o root -g root -m 0644 "$script_dir/helper.py" /opt/newswatch-admin-ops/helper.py
 install -o root -g root -m 0644 "$script_dir/newswatch-admin-ops.service" /etc/systemd/system/newswatch-admin-ops.service
 systemctl daemon-reload
-systemctl enable --now newswatch-admin-ops.service
+systemctl enable newswatch-admin-ops.service
 systemctl restart newswatch-admin-ops.service
 systemctl status --no-pager newswatch-admin-ops.service

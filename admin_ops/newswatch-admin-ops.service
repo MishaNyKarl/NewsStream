@@ -1,7 +1,7 @@
 [Unit]
 Description=Restricted NewsStream admin operations
-After=docker.service
-Requires=docker.service
+After=local-fs.target
+Before=docker.service
 
 [Service]
 Type=simple
@@ -13,6 +13,7 @@ Group=10001
 UMask=0027
 RuntimeDirectory=newswatch-admin-ops
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 StateDirectory=newswatch-admin-ops
 StateDirectoryMode=0700
 NoNewPrivileges=true
