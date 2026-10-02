@@ -200,5 +200,27 @@ class UsageEvent(Base):
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
     estimated_cost: Mapped[float] = mapped_column(Float, default=0)
+    cost_source: Mapped[str] = mapped_column(String(16), default='unknown', server_default='unknown')
+    currency: Mapped[str | None] = mapped_column(String(8))
+    actual_cost: Mapped[float | None] = mapped_column(Float)
+    request_id: Mapped[str | None] = mapped_column(String(64), index=True)
     detail: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class ProductEvent(Base):
+    """Coarse behaviour only: no message text, URLs, callback payloads or story identifiers."""
+    __tablename__ = 'product_events'
+    __table_args__ = (Index('ix_product_user_time', 'user_id', 'created_at'),
+                     Index('ix_product_event_time', 'event', 'created_at'),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey('users.telegram_id', ondelete='SET NULL'))
+    event: Mapped[str] = mapped_column(String(64), nullable=False)
+    dedupe_key: Mapped[str | None] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
+
+
+class AnalyticsState(Base):
+    __tablename__ = 'analytics_state'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)

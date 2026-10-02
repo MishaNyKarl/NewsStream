@@ -67,7 +67,8 @@ async def login(client):
 
 
 @pytest.mark.parametrize('path', ['/', '/users', '/stories', '/costs', '/checks', '/errors',
-                                   '/notifications', '/project', '/calculator', '/docs', '/audit'])
+                                   '/notifications', '/project', '/calculator', '/docs', '/audit',
+                                   '/analytics', '/analytics.csv'])
 async def test_every_private_page_requires_session(admin, path):
     client, *_ = admin
     response = await client.get(path)
@@ -405,3 +406,30 @@ def test_helper_status_never_returns_container_environment(tmp_path, monkeypatch
     result = helper.Operations(tmp_path/'ops.db', runner).status()
     assert result['host']['memory_available_mb'] == 500 and result['host']['uptime_hours'] == 2
     assert 'secret-should-not-leak' not in json.dumps(result)
+
+async def test_product_analytics_dashboard_and_csv(admin):
+    from app.models import AnalyticsState, ProductEvent
+    client, app, data, *_ = admin
+    now = utcnow()
+    async with data.sessions() as session:
+        session.add(User(telegram_id=999, created_at=now-timedelta(days=2), is_admin=False))
+        await session.flush()
+        session.add(AnalyticsState(id=1, started_at=now-timedelta(days=3)))
+        session.add(ProductEvent(user_id=999, event='interaction_start', created_at=now-timedelta(hours=1)))
+        await session.commit()
+    await login(client)
+    response = await client.get('/analytics')
+    assert response.status_code == 200
+    assert '999' in response.text and 'D7' in response.text and 'Скачать CSV' in response.text
+    export = await client.get('/analytics.csv')
+    assert export.status_code == 200 and export.content.startswith(b'\xef\xbb\xbf')
+    assert '999;' in export.text
+    assert app.state.audit_rows(1)[0]['action'] == 'analytics_export'
+    assert (await client.get('/analytics?start=invalid')).status_code == 400
+
+
+async def test_product_analytics_requires_coverage_marker(admin):
+    client, *_ = admin
+    await login(client)
+    assert 'ещё не собирается' in (await client.get('/analytics')).text
+    assert (await client.get('/analytics.csv')).status_code == 400

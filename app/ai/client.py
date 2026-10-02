@@ -80,6 +80,7 @@ class AIClient:
                                       detail=f'{purpose}:{attempt + 1}')
         input_tokens = output_tokens = 0
         cost = 0.0
+        cost_source, currency, actual_cost = 'unknown', None, None
         status_label = 'transport_error'
         headers = {'Authorization': f'Bearer {self.settings.llm_api_key or "ollama"}',
                    'Content-Type': 'application/json'}
@@ -119,9 +120,19 @@ class AIClient:
                 output_tokens = int(_number(usage.get('completion_tokens')))
                 if usage.get('cost') is not None:
                     cost = _number(usage['cost'])
+                    try:
+                        supplied = float(usage['cost'])
+                        valid = not isinstance(usage['cost'], bool) and math.isfinite(supplied) and supplied >= 0
+                    except (TypeError, ValueError, OverflowError):
+                        valid = False
+                    # OpenRouter documents usage.cost in USD. Other backends must state currency explicitly.
+                    if valid and (provider == 'openrouter' or usage.get('currency') == 'USD'):
+                        cost_source, currency, actual_cost = 'provider', 'USD', supplied
                 else:
                     cost = (input_tokens * self.settings.llm_input_cost_per_million +
                             output_tokens * self.settings.llm_output_cost_per_million) / 1_000_000
+                    if (input_tokens or output_tokens) and cost > 0:
+                        cost_source, currency = 'estimate', 'USD'
                 if response.status in (401, 402, 403):
                     raise ProviderUnavailable('Сервис анализа недоступен: администратору нужно проверить ключ и баланс API.')
                 if response.status != 200 or payload.get('error'):
@@ -141,7 +152,8 @@ class AIClient:
             if self.usage_callback:
                 await self.usage_callback(operation='llm', provider=provider, model=model,
                     input_tokens=input_tokens, output_tokens=output_tokens, estimated_cost=cost,
-                    detail=f'{purpose}:{status_label}')
+                    detail=f'{purpose}:{status_label}', cost_source=cost_source,
+                    currency=currency, actual_cost=actual_cost)
 
     async def _complete(self, prompt, data, schema, purpose, validate=None):
         schema_text = json.dumps(schema.model_json_schema(), ensure_ascii=False)

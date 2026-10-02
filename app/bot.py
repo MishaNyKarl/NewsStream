@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from aiogram import BaseMiddleware, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BufferedInputFile, CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters
+from aiogram.types import BufferedInputFile, CallbackQuery, ChatMemberUpdated, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters
 
 from app.domain import UserError
 from app.monitoring import IntensiveSlotOccupied
@@ -23,6 +23,7 @@ from app import user_news
 from app.journal import DATE_HELP, DATE_PROMPT, PAGE_SIZE, date_window, parse_journal_callback, preset_window
 from app.telegram_progress import ProgressEditBudget, TelegramProgress
 from app.telegram_input import AlbumMiddleware, extract_story_input
+from app.product_analytics import interaction_category
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_UNITS = 3900
@@ -286,6 +287,10 @@ class AccessMiddleware(BaseMiddleware):
             if admitted is None:
                 await self._tell(event, f"{DENIED}\nВаш Telegram ID: {user.id}", alert=True)
                 return None
+            track = getattr(self.service, 'track_interaction', None)
+            if track:
+                event_key = f'callback:{event.id}' if isinstance(event, CallbackQuery) else f'message:{event.message_id}'
+                await track(user.id, interaction_category(event), event_key)
             # /start has its own bucket: the first topic is often sent immediately.
             now = self.clock()
             kind = "start" if start_arg is not None else ("callback" if isinstance(event, CallbackQuery) else "message")
@@ -354,6 +359,16 @@ def build_router(service: Any, settings: Any) -> Router:
     router.message.outer_middleware(AlbumMiddleware())
     router.message.outer_middleware(access)
     router.callback_query.outer_middleware(access)
+
+    @router.my_chat_member()
+    async def membership(event: ChatMemberUpdated, event_update=None):
+        if event.chat.type != 'private':
+            return
+        old, new = event.old_chat_member.status, event.new_chat_member.status
+        if (old == 'kicked') == (new == 'kicked'):
+            return
+        key = str(event_update.update_id) if event_update is not None else f'{event.date.isoformat()}:{old}:{new}'
+        await service.track_membership(event.chat.id, new == 'kicked', f'membership:{key}')
 
     async def show_main(message, replace=False):
         await (_replace if replace else _answer)(message,

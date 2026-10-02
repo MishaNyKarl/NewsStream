@@ -24,6 +24,7 @@ from app.domain import Analysis, Candidate, InterestSaveResult, StoryExtraction,
 from app.models import Feedback, Source, Story, StoryUpdate, UsageEvent, User, UserInterest, UserNews, utcnow
 from app.news_repository import NewsRepository
 from app.monitoring import INTENSIVE_DURATION, IntensiveSlotOccupied, completion_next, next_checkpoint
+from app.product_analytics import BUSINESS_EVENTS, ProductAnalyticsRepository, add_event
 
 _sqlite_locks = WeakKeyDictionary()
 _ADMISSION_LOCK = 419281701
@@ -36,7 +37,7 @@ def _day_start():
     return utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-class Repository(NewsRepository):
+class Repository(NewsRepository, ProductAnalyticsRepository):
     def __init__(self, settings, session_factory=None):
         if session_factory is None:
             from app.db import Session
@@ -77,6 +78,8 @@ class Repository(NewsRepository):
     @staticmethod
     def _event(session, operation, user_id=None, story_id=None, **kwargs):
         session.add(UsageEvent(operation=operation, user_id=user_id, story_id=story_id, **kwargs))
+        if operation in BUSINESS_EVENTS:
+            add_event(session, BUSINESS_EVENTS[operation], user_id)
 
     @staticmethod
     def _daily(story):
@@ -235,7 +238,7 @@ class Repository(NewsRepository):
         await session.execute(delete(Source).where(Source.story_id == story.id))
         await session.execute(delete(StoryUpdate).where(StoryUpdate.story_id == story.id))
         await session.execute(update(UsageEvent).where(UsageEvent.story_id == story.id).values(
-            user_id=None, story_id=None, detail=None))
+            user_id=None, story_id=None, detail=None, request_id=None))
         story.title = "Удалено"
         story.original_input = story.summary = story.current_state = ""
         story.original_url = None
@@ -299,7 +302,9 @@ class Repository(NewsRepository):
             return await session.scalar(select(Story).where(Story.id == story_id,
                 Story.user_id == user_id, Story.status != "deleted"))
 
-    async def set_status(self, user_id, story_id, status):
+    async def set_status(self, user_id, story_id, status, reason='user'):
+        if reason not in {'user', 'delivery_forbidden'}:
+            raise ValueError('Unsupported status reason')
         if status not in ("active", "paused", "deleted"):
             raise ValueError("Unsupported story status")
         async with self._transaction() as session:
@@ -310,6 +315,8 @@ class Repository(NewsRepository):
                 old_status = story.status
                 await self._redact(session, story)
                 self._event(session, "story_cancelled" if old_status == "draft" else "story_deleted")
+                if old_status != 'draft':
+                    add_event(session, 'watch_deleted', user_id)
             elif story.status == "draft":
                 raise UserError("Сначала подтвердите создание наблюдения.")
             elif story.status != status:
@@ -321,7 +328,9 @@ class Repository(NewsRepository):
                 story.next_check_at = utcnow() if status == "active" else None
                 if status == "active" and story.monitoring_mode == "intensive":
                     story.next_check_at = next_checkpoint(story.intensive_started_at, utcnow())
-                self._event(session, "story_resumed" if status == "active" else "story_paused", user_id, story.id)
+                operation = ('story_resumed' if status == 'active' else
+                             'story_paused_delivery' if reason == 'delivery_forbidden' else 'story_paused')
+                self._event(session, operation, user_id, story.id)
             return story
 
     async def claim_story(self, story_id, user_id=None, manual=False):
@@ -492,11 +501,15 @@ class Repository(NewsRepository):
             if story is None:
                 return False
             existing = await session.get(Feedback, (user_id, update_id))
+            if existing is not None and existing.feedback_type == kind:
+                return True
             if existing is None:
                 session.add(Feedback(user_id=user_id, update_id=update_id, story_id=story.id, feedback_type=kind))
             else:
                 existing.feedback_type = kind
-            self._event(session, "notification_feedback_" + kind, user_id, story.id)
+            is_demo = await session.scalar(select(StoryUpdate.is_demo).where(StoryUpdate.id == update_id))
+            if not is_demo:
+                self._event(session, "notification_feedback_" + kind, user_id, story.id)
             return True
 
     async def pending_notifications(self, limit=10):
@@ -531,9 +544,15 @@ class Repository(NewsRepository):
                     item.telegram_message_id = telegram_message_id
                 item.delivery_locked_until = None
                 self._event(session, "notification_sent", story_id=item.story_id)
+                owner = await session.scalar(select(Story.user_id).where(Story.id == item.story_id))
+                if not item.is_demo:
+                    add_event(session, 'notification_sent', owner)
             else:
                 # Persist backoff, including across process restarts.
                 item.delivery_locked_until = now + timedelta(seconds=min(300, 15 * 2 ** item.delivery_attempts))
+                owner = await session.scalar(select(Story.user_id).where(Story.id == item.story_id))
+                if not item.is_demo:
+                    add_event(session, 'notification_failed', owner)
             self._delivery_tokens.pop(update_id, None)
 
     async def create_demo(self, user_id, story_id):
@@ -550,18 +569,21 @@ class Repository(NewsRepository):
             return item
 
     async def record_usage(self, operation, provider="", user_id=None, story_id=None, input_tokens=0,
-                           output_tokens=0, estimated_cost=0, detail=None, model=None, **kwargs):
+                           output_tokens=0, estimated_cost=0, detail=None, model=None,
+                           cost_source='unknown', currency=None, actual_cost=None, request_id=None, **kwargs):
         async with self._transaction() as session:
             # A check can finish after deletion: preserve counts without resurrecting content.
             if story_id is not None:
                 story = await session.scalar(select(Story).where(Story.id == story_id).with_for_update(key_share=True))
                 if story is None or story.status == "deleted":
                     story_id = user_id = detail = None
+                    request_id = None
             self._event(session, operation[:80], user_id, story_id, provider=provider[:80],
                 model=model[:160] if model else None, input_tokens=max(0, input_tokens),
-                output_tokens=max(0, output_tokens), estimated_cost=max(0, estimated_cost), detail=detail)
+                output_tokens=max(0, output_tokens), estimated_cost=max(0, estimated_cost), detail=detail,
+                cost_source=cost_source, currency=currency, actual_cost=actual_cost, request_id=request_id)
 
-    async def reserve_llm_call(self, user_id=None, story_id=None):
+    async def reserve_llm_call(self, user_id=None, story_id=None, request_id=None):
         async with self._transaction() as session:
             await self._advisory(session, _LLM_BUDGET_LOCK)
             count = await session.scalar(select(func.count()).select_from(UsageEvent).where(
@@ -572,7 +594,8 @@ class Repository(NewsRepository):
                 story = await session.scalar(select(Story).where(Story.id == story_id).with_for_update(key_share=True))
                 if story is None or story.status == "deleted":
                     story_id = user_id = None
-            self._event(session, "llm_reserved", user_id, story_id)
+                    request_id = None
+            self._event(session, "llm_reserved", user_id, story_id, request_id=request_id)
             return True
 
     async def usage_count_today(self, operation):

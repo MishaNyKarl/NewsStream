@@ -2,6 +2,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 import hmac
+import csv
+import io
 from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlsplit
@@ -13,6 +15,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from starlette.responses import Response
 from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
 
@@ -22,10 +25,12 @@ from app.admin.data import Data, Filters, MSK, identifier
 from app.admin.ops import Ops
 from app.admin.password import HASHER
 from app.admin.state import State
+from app.admin.product import report as product_report
 
 COOKIE = '__Host-newswatch-admin'
 ROOT = Path(__file__).parent
 TITLES = {'/': 'Обзор', '/users': 'Пользователи', '/stories': 'Наблюдения', '/costs': 'Расходы LLM',
+          '/analytics': 'Аналитика продукта',
           '/checks': 'Проверки', '/errors': 'Ошибки', '/notifications': 'Уведомления',
           '/calculator': 'Калькулятор', '/project': 'Проект и сервер', '/docs': 'Документация', '/audit': 'Журнал действий'}
 
@@ -100,6 +105,9 @@ def create_app(config=None, data=None, ops=None):
     templates.filters['money'] = lambda v: '—' if v is None else f'{v:.6f}'
     templates.filters['rub'] = lambda v: '—' if v is None else f'{v:.2f}'
     templates.filters['timestamp'] = lambda v: display(datetime.fromtimestamp(v, MSK))
+    templates.filters['duration'] = lambda v: '—' if v is None else (
+        f'{v/86400:.1f} дн.' if v >= 86400 else f'{v/3600:.1f} ч' if v >= 3600 else f'{v/60:.1f} мин')
+    templates.filters['percent'] = lambda v: '—' if v is None else f'{v:.1f}%'
 
     def render(request, template, status=200, **context):
         session = request.state.admin_session
@@ -206,6 +214,43 @@ def create_app(config=None, data=None, ops=None):
         return render(request, 'calculator.html', status=status, fields=FIELDS, values=values,
                       error=error, result=calculate(values) if not error else {})
 
+    async def analytics(request):
+        try:
+            filters = Filters.parse(request.query_params)
+            include_admins = request.query_params.get('admins') == '1'
+            async with asyncio.timeout(15):
+                result = await product_report(data, filters, include_admins)
+            if request.url.path.endswith('.csv'):
+                if result.get('unavailable'):
+                    raise ValueError('Сбор аналитики ещё не включён. Нужна миграция 0007.')
+                stream = io.StringIO(newline='')
+                writer = csv.writer(stream, delimiter=';')
+                writer.writerow(['telegram_id', 'is_admin', 'registered_at_msk', 'actions', 'active_days',
+                    'sessions', 'median_observed_span_seconds', 'median_return_gap_seconds', 'last_observed_action_msk',
+                    'confirmed_usd', 'estimated_usd', 'unknown_calls', 'period_start', 'period_end_exclusive', 'coverage_start'])
+                for row in result['users']:
+                    writer.writerow([row['user_id'], row['admin'], display(row['created_at']), row['actions'],
+                        row['active_days'], row['sessions'], row['median_span'], row['median_gap'],
+                        display(row['last_action']), row['billing']['confirmed'], row['billing']['estimated'],
+                        row['billing']['unknown_calls'], filters.start.isoformat(), result['cutoff'].isoformat(),
+                        result['coverage'].isoformat()])
+                state.audit(config.username, 'analytics_export', result='ok')
+                return Response('\ufeff'+stream.getvalue(), media_type='text/csv; charset=utf-8',
+                                headers={'Content-Disposition': 'attachment; filename="newsstream-analytics.csv"'})
+            start = (filters.page-1)*50
+            return render(request, 'analytics.html', result=result, filters=filters.form, include_admins=include_admins,
+                          users=result.get('users', [])[start:start+50], sessions=result.get('sessions', [])[:50],
+                          requests=result.get('requests', [])[:50], page=filters.page,
+                          more=len(result.get('users', [])) > start+50,
+                          previous=str(request.url.include_query_params(page=filters.page-1)),
+                          next=str(request.url.include_query_params(page=filters.page+1)),
+                          export='/analytics.csv?'+str(request.query_params))
+        except ValueError as exc:
+            return render(request, 'message.html', status=400, message=str(exc))
+        except Exception:
+            return render(request, 'message.html', status=503,
+                          message='Аналитика недоступна. Проверьте миграцию 0007 и SELECT-права на product_events и analytics_state.')
+
     async def project(request):
         status = await ops.status()
         return render(request, 'project.html', health=status, config=config,
@@ -277,6 +322,7 @@ def create_app(config=None, data=None, ops=None):
     routes = [Route('/login', login, methods=['GET', 'POST']), Route('/logout', logout, methods=['POST']),
               Route('/healthz', health), Route('/calculator', calculator, methods=['GET', 'POST']),
               Route('/project', project), Route('/restart/prepare', restart_prepare, methods=['POST']),
+              Route('/analytics', analytics), Route('/analytics.csv', analytics),
               Route('/restart', restart, methods=['POST']), Route('/docs', docs), Route('/audit', audit),
               Mount('/static', StaticFiles(directory=ROOT/'static'), name='static')]
     routes += [Route(path, dashboard) for path in ('/', '/users', '/stories', '/costs', '/checks', '/errors', '/notifications')]

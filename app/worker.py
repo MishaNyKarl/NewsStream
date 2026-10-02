@@ -24,7 +24,8 @@ async def deliver_news_ready(service, bot):
                         allow_sending_without_reply=True) if fresh.input_message_id else None)
                 success = True
         except TelegramForbiddenError:
-            await service.repo.defer_user_news(item.user_id, item.id)
+            await service.repo.record_product_event('delivery_forbidden', item.user_id, f'forbidden:news:{item.id}')
+            await service.repo.defer_user_news(item.user_id, item.id, reason='delivery_forbidden')
         except TelegramRetryAfter as exc:
             retry_after = exc.retry_after
         except Exception as exc:
@@ -44,7 +45,8 @@ async def deliver_notifications(service, bot):
                 message_id = message.message_id
                 success = True
         except TelegramForbiddenError:
-            await service.repo.set_status(story.user_id, story.id, 'paused')
+            await service.repo.record_product_event('delivery_forbidden', story.user_id, f'forbidden:update:{update.id}')
+            await service.repo.set_status(story.user_id, story.id, 'paused', reason='delivery_forbidden')
         except TelegramRetryAfter as exc:
             await asyncio.sleep(min(exc.retry_after, 30))
         except Exception as exc:

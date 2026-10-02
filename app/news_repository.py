@@ -8,6 +8,7 @@ from sqlalchemy import delete, func, or_, select
 
 from app.domain import InterestSaveResult, StoryExtraction, UserError
 from app.models import Story, User, UserInterest, UserNews, utcnow
+from app.product_analytics import add_event
 
 
 class NewsRepository:
@@ -25,6 +26,7 @@ class NewsRepository:
                             input_message_id=input_message_id, status='pending')
             db.add(item)
             await db.flush()
+            add_event(db, 'news_submitted', user_id)
             return item
 
     async def list_user_news(self, user_id, before_id=0):
@@ -68,8 +70,10 @@ class NewsRepository:
                 item.parsed_data = extraction.model_dump()
                 item.source_url = source_url or item.source_url
                 item.status = 'ready'
+                add_event(db, 'news_ready', user_id)
             else:
                 item.status = 'failed'
+                add_event(db, 'news_failed', user_id)
                 item.error_message = (error or 'Не удалось завершить обработку. Можно повторить.')[:1200]
             return item
 
@@ -144,18 +148,22 @@ class NewsRepository:
             self._event(db, 'interest_saved', user_id=user_id)
             return InterestSaveResult(interest, True, status)
 
-    async def defer_user_news(self, user_id, news_id):
+    async def defer_user_news(self, user_id, news_id, reason='user'):
         async with self._transaction() as db:
             item = await db.scalar(select(UserNews).where(UserNews.user_id == user_id,
                 UserNews.id == news_id).with_for_update(key_share=True))
             if item is None:
                 raise UserError('Новость удалена или недоступна.')
+            if not item.notice_suppressed and reason == 'user':
+                add_event(db, 'news_deferred', user_id)
             item.notice_suppressed = True
 
     async def delete_user_news(self, user_id, news_id):
         async with self._transaction() as db:
             await db.scalar(select(User).where(User.telegram_id == user_id).with_for_update(key_share=True))
-            await db.execute(delete(UserNews).where(UserNews.user_id == user_id, UserNews.id == news_id))
+            removed = await db.execute(delete(UserNews).where(UserNews.user_id == user_id, UserNews.id == news_id))
+            if removed.rowcount:
+                add_event(db, 'news_deleted', user_id)
 
     async def pending_news_notices(self):
         async with self._transaction() as db:
@@ -181,5 +189,7 @@ class NewsRepository:
             if success:
                 item.notice_sent_at = utcnow()
                 item.notice_locked_until = None
+                add_event(db, 'ready_notice_sent', user_id)
             else:
+                add_event(db, 'ready_notice_failed', user_id)
                 item.notice_locked_until = utcnow() + timedelta(seconds=max(retry_after, min(300, 15 * 2**item.notice_attempts)))

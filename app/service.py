@@ -8,6 +8,7 @@ import time
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from app.ai.client import AIClient
 from app.config import Settings
@@ -64,6 +65,19 @@ class BotService:
         if not (admin or user_id in self.settings.allowed_ids or invited):
             return None
         return await self.repo.admit_user(user_id, username=username, first_name=first_name, is_admin=admin)
+
+    async def track_interaction(self, user_id, category, event_key):
+        try:
+            await self.repo.record_product_event('interaction_' + category, user_id, event_key)
+        except Exception as exc:
+            # Observability must not prevent the original user action; no raw payload in logs.
+            log.warning('analytics_interaction_failed type=%s', type(exc).__name__)
+
+    async def track_membership(self, user_id, blocked, event_key):
+        try:
+            await self.repo.record_product_event('bot_blocked' if blocked else 'bot_unblocked', user_id, event_key)
+        except Exception as exc:
+            log.warning('analytics_membership_failed type=%s', type(exc).__name__)
 
     async def is_admin(self, user_id):
         user = await self.repo.get_user(user_id)
@@ -131,7 +145,7 @@ class BotService:
         if user_id in self._creating:
             raise UserError('Ещё разбираю предыдущее сообщение. Подождите немного.')
         self._creating.add(user_id)
-        ctx = usage_context.set({'user_id': user_id})
+        ctx = usage_context.set({'user_id': user_id, 'request_id': uuid4().hex})
         try:
             await self.repo.record_usage('story_input_received', user_id=user_id)
             # Only public forwarded-post references are accepted as provenance.
@@ -360,7 +374,7 @@ class BotService:
 
     async def check_story(self, story, progress=None):
         started = time.monotonic()
-        ctx = usage_context.set({'user_id': story.user_id, 'story_id': story.id})
+        ctx = usage_context.set({'user_id': story.user_id, 'story_id': story.id, 'request_id': uuid4().hex})
         progress_token = progress_context.set(progress)
         metrics = CheckMetrics()
         candidates = []

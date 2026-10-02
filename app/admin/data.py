@@ -1,4 +1,4 @@
-"""Bounded, read-only queries against the existing bot schema. No migrations."""
+"""Bounded, read-only queries against the bot schema; never runs migrations."""
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -162,11 +162,13 @@ class Data:
             return headers, rows[:50], len(rows) > 50
 
     async def costs(self, filters, rates):
+        from app.admin.product import cost_columns
         where = [*filters.event_conditions(), UsageEvent.operation == 'llm']
         columns = [func.count().label('calls'), func.sum(UsageEvent.estimated_cost).label('recorded'),
                    func.sum(UsageEvent.input_tokens).label('input'), func.sum(UsageEvent.output_tokens).label('output'),
                    func.sum(cast(or_(UsageEvent.input_tokens > 0, UsageEvent.output_tokens > 0),
                                  Integer)).label('with_tokens')]
+        columns.extend(cost_columns())
         async with self.sessions() as s:
             total = dict((await s.execute(select(*columns).where(*where))).mappings().one())
             by_user = [dict(r) for r in (await s.execute(select(UsageEvent.user_id, *columns).where(*where)

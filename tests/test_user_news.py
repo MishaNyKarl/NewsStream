@@ -327,7 +327,9 @@ async def test_ready_notice_failures_are_bounded_and_do_not_record_delivery(kind
     service.repo.mark_news_notice.assert_awaited_once_with(100, 21, 'ready-lease', False,
         retry_after=60 if kind == 'flood' else 0)
     if kind == 'blocked':
-        service.repo.defer_user_news.assert_awaited_once_with(100, 21)
+        service.repo.defer_user_news.assert_awaited_once_with(100, 21, reason='delivery_forbidden')
+        service.repo.record_product_event.assert_awaited_once_with(
+            'delivery_forbidden', 100, 'forbidden:news:21')
 
 
 async def test_home_always_sends_a_new_root_message_so_progress_cannot_overwrite_it():
