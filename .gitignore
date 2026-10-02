@@ -13,3 +13,10 @@ venv/
 backups/
 private-access*
 *.log
+work/
+outputs/
+.deploy-state/
+*.pem
+*.key
+*.p12
+*.pfx

@@ -1,0 +1,99 @@
+name: NewsStream CI and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: newsstream-${{ github.event_name == 'pull_request' && github.ref || 'production-main' }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    name: Tests and validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: newswatch
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: newswatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U newswatch -d newswatch_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      NEWSWATCH_TEST_DATABASE_URL: postgresql+asyncpg://newswatch:ci-only-password@127.0.0.1:5432/newswatch_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-admin.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install -e ".[test]"
+          if [ -f requirements-admin.txt ]; then python -m pip install -r requirements-admin.txt; fi
+      - name: Credential pattern scan
+        run: python deploy/scan_secrets.py
+      - name: Lint
+        run: python -m ruff check app migrations tests deploy
+      - name: Full PostgreSQL tests
+        run: python -m pytest -q
+      - name: Validate deployment package
+        run: |
+          python deploy/package.py /tmp/newsstream-release.tar.gz
+          python -c "from pathlib import Path; from deploy.remote import validate_archive; import subprocess; validate_archive(Path('/tmp/newsstream-release.tar.gz'), subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip())"
+      - name: Validate Compose
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+
+  deploy:
+    name: Deploy main to server
+    needs: checks
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Create release from tested commit
+        run: python deploy/package.py /tmp/newsstream-release.tar.gz
+      - name: Upload and request detached deployment
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/newsstream-ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/newsstream-ssh/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/newsstream-ssh/known_hosts"
+          SSH_ARGS=(-i "$RUNNER_TEMP/newsstream-ssh/key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$RUNNER_TEMP/newsstream-ssh/known_hosts" -o ConnectTimeout=15)
+          ssh "${SSH_ARGS[@]}" "$DEPLOY_USER@$DEPLOY_HOST" "upload $GITHUB_SHA" < /tmp/newsstream-release.tar.gz
+          ssh "${SSH_ARGS[@]}" "$DEPLOY_USER@$DEPLOY_HOST" "deploy $GITHUB_SHA"
+          python deploy/poll.py "$DEPLOY_HOST" "$DEPLOY_USER" "$RUNNER_TEMP/newsstream-ssh/key" "$RUNNER_TEMP/newsstream-ssh/known_hosts" "$GITHUB_SHA"
+      - name: Remove runner key
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/newsstream-ssh"
