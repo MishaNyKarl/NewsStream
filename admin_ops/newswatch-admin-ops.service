@@ -1,0 +1,31 @@
+[Unit]
+Description=Restricted NewsStream admin operations
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/newswatch-admin-ops/helper.py
+Restart=on-failure
+RestartSec=5
+User=root
+Group=10001
+UMask=0027
+RuntimeDirectory=newswatch-admin-ops
+RuntimeDirectoryMode=0750
+StateDirectory=newswatch-admin-ops
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/run/newswatch-admin-ops /var/lib/newswatch-admin-ops
+MemoryMax=128M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

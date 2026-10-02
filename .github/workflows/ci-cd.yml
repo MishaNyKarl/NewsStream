@@ -51,7 +51,9 @@ jobs:
       - name: Credential pattern scan
         run: python deploy/scan_secrets.py
       - name: Lint
-        run: python -m ruff check app migrations tests deploy
+        run: |
+          python -m ruff check app migrations tests deploy
+          if [ -d admin_ops ]; then python -m ruff check admin_ops; fi
       - name: Full PostgreSQL tests
         run: python -m pytest -q
       - name: Validate deployment package
@@ -62,6 +64,7 @@ jobs:
         run: |
           cp .env.example .env
           docker compose config --quiet
+          if [ -f compose.admin.yaml ]; then ADMIN_ENV_FILE="$PWD/admin_ops/env.example" docker compose -f compose.admin.yaml config --quiet; fi
 
   deploy:
     name: Deploy main to server

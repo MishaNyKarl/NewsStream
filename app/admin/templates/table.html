@@ -1,0 +1,5 @@
+{% extends 'base.html' %}{% block content %}{% include 'filters.html' %}
+{% if request.url.path == '/stories' %}<p class="muted">Текущие наблюдения: фильтр дат не применяется. Режим intensive может быть истёкшим — смотрите срок.</p>{% endif %}
+{% if request.url.path == '/users' %}<p class="muted">Показаны пользователи, чья последняя активность попадает в период. История всех посещений не хранится.</p>{% endif %}
+{% if request.url.path == '/checks' %}<p class="muted">События проверок, а не уникальные проверки: check и story_check_completed могут описывать одну работу. Длительность есть только в отдельных событиях check.</p>{% endif %}
+<div class="table-wrap"><table><thead><tr>{% for col in headers %}<th>{{ col }}</th>{% endfor %}</tr></thead><tbody>{% for row in rows %}<tr>{% for cell in row %}<td>{{ cell|display }}</td>{% endfor %}</tr>{% else %}<tr><td colspan="{{ headers|length }}">Записей за выбранный период нет.</td></tr>{% endfor %}</tbody></table></div>{% include 'pagination.html' %}{% endblock %}

@@ -1,0 +1,61 @@
+name: newswatch-admin
+services:
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile.admin
+    image: newswatch-admin:local
+    env_file:
+      - path: ${ADMIN_ENV_FILE:-/etc/newswatch-admin/admin.env}
+        format: raw
+    environment:
+      ADMIN_BIND: 0.0.0.0
+      ADMIN_PORT: 8443
+      ADMIN_TLS_CERT: /tls/server.crt
+      ADMIN_TLS_KEY: /tls/server.key
+      ADMIN_STATE_PATH: /data/admin.sqlite3
+      ADMIN_DOCS_PATH: /app/docs
+    # TLS terminates inside this container; there is no plaintext listener.
+    ports:
+      - "${ADMIN_BIND_IP:-127.0.0.1}:${ADMIN_PUBLISHED_PORT:-8443}:8443"
+    networks: [bot_data]
+    volumes:
+      - admin_state:/data
+      - type: bind
+        source: ${ADMIN_TLS_DIR:-/etc/newswatch-admin/tls}
+        target: /tls
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ADMIN_DOCS_DIR:-./docs}
+        target: /app/docs
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ADMIN_OPS_DIR:-/run/newswatch-admin-ops}
+        target: /run/newswatch-admin-ops
+        read_only: true
+        bind: {create_host_path: false}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    healthcheck:
+      test: [CMD, python, -c, "import os,ssl,urllib.request; from urllib.parse import urlsplit; r=urllib.request.Request('https://127.0.0.1:8443/healthz',headers={'Host':urlsplit(os.environ['ADMIN_ORIGIN']).netloc}); assert urllib.request.urlopen(r,context=ssl._create_unverified_context(),timeout=4).read()==b'ok'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+networks:
+  bot_data:
+    external: true
+    name: newswatch_default
+volumes:
+  admin_state:

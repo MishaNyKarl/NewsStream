@@ -1,0 +1,19 @@
+# Separate, small runtime; does not install bot/AI dependencies.
+starlette==1.7.0
+uvicorn==0.54.0
+Jinja2==3.1.6
+argon2-cffi==25.1.0
+SQLAlchemy==2.0.54
+asyncpg==0.31.0
+# Runtime transitive dependencies are pinned as well.
+anyio==4.15.1
+idna==3.20
+typing_extensions==4.16.0
+click==8.5.0
+h11==0.16.0
+greenlet==3.5.6
+MarkupSafe==3.0.3
+argon2-cffi-bindings==26.1.0
+cffi==2.1.1
+pycparser==3.0
+colorama==0.4.6; sys_platform == "win32"

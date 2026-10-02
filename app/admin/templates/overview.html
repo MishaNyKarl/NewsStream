@@ -1,0 +1,4 @@
+{% extends 'base.html' %}{% block content %}{% include 'filters.html' %}
+<p class="ok">База данных доступна · запросы только для чтения</p><div class="metrics">{% for label,value in overview.items() %}<article><span>{{ label }}</span><strong>{{ value|display }}</strong></article>{% endfor %}</div>
+<p class="muted">Очереди и режимы — текущий снимок. Активность определяется last_seen_at; исторические посещения пользователя не сохраняются. Подписки здесь — наблюдения за темами; учёт оплаты в боте отсутствует.</p>
+{% include 'health.html' %}{% endblock %}

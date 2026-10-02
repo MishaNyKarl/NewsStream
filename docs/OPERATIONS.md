@@ -1,12 +1,12 @@
 # Эксплуатация
 
-Рабочий каталог на сервере: `/opt/news-watch-bot`. Изолированные контейнеры имеют префикс `newswatch`. Приложение не требует открытия входящих портов. Используются исходящие HTTPS-запросы к Telegram, OpenRouter и новостным источникам.
+Рабочий каталог на сервере: `/opt/news-watch-bot`, активные исходники после CI/CD — `/opt/news-watch-bot/current`. Изолированные контейнеры имеют префикс `newswatch`. Бот использует исходящие HTTPS-запросы к Telegram, OpenRouter и новостным источникам. Админка работает отдельно на HTTPS-порту 8443; настройки и доступ описаны в [ADMIN](ADMIN.md).
 
 ```sh
-cd /opt/news-watch-bot
-docker compose ps
-docker compose logs --since 1h --tail 200 bot worker
-docker compose exec db pg_isready -U newswatch -d newswatch
+docker ps --filter name=newswatch
+docker logs --since 1h --tail 200 newswatch-bot-1
+docker logs --since 1h --tail 200 newswatch-worker-1
+docker exec newswatch-db-1 pg_isready -U newswatch -d newswatch
 ```
 
 Healthcheck проверяет работоспособность цикла процесса, но не гарантирует доступность внешних API. Сбои поиска/модели видны в `/admin_errors`; неудачная проверка откладывается на 30 минут. Перезапуск контейнера не удаляет наблюдения, квоты, историю или очередь уведомлений. Docker restart policy восстанавливает процессы после перезапуска сервера; убедитесь, что Docker включён в автозагрузку.
@@ -14,9 +14,10 @@ Healthcheck проверяет работоспособность цикла п�
 ## Резервная копия
 
 ```sh
+cd /opt/news-watch-bot
 mkdir -p backups
 chmod 700 backups
-docker compose exec -T db pg_dump -U newswatch -d newswatch -Fc > backups/newswatch.dump
+docker exec newswatch-db-1 pg_dump -U newswatch -d newswatch -Fc > backups/newswatch.dump
 chmod 600 backups/newswatch.dump
 ```
 
@@ -26,21 +27,11 @@ chmod 600 backups/newswatch.dump
 
 В версии с личными новостями действует миграция `0006_user_news`. Сохранение исходных сообщений, повтор обработки и доставка готовности описаны в [USER_NEWS](USER_NEWS.md). Резервная копия этого обновления — `backups/user-news-20260930`, образ отката — `newswatch:before-user-news`. При возврате прежнего приложения новую таблицу оставляют, чтобы не потерять присланные новости.
 
-1. Сохраните резервную копию БД и `.env`.
-2. Загрузите новый исходный код, сохранив `.env`.
-3. Для совместимых добавочных миграций подготовьте образ и схему при работающем приложении; не останавливайте бот отдельной командой перед длительными шагами:
-
-```sh
-docker compose build
-docker compose run --rm --no-deps bot alembic upgrade head
-docker compose run --rm --no-deps bot alembic check
-docker compose ps
-docker compose logs --tail 100 bot worker
-```
+Обычное обновление: commit и push в `main` репозитория NewsStream. [CI/CD](CI_CD.md) выполняет тесты, сборку, резервную копию, миграции, замену контейнеров и проверку здоровья. Не собирайте и не запускайте production из старого Compose в корне `/opt/news-watch-bot`: он сохранён для первоначального отката.
 
 Нельзя использовать `docker compose down -v` для обычного перезапуска: это удаляет том с БД. Для отката приложения сохраните предыдущий образ; миграции и данные откатывайте только по отдельно проверенному плану.
 
-Финальное переключение выполняйте независимым серверным процессом с журналом, откатом и обязательным запуском сервисов при выходе. Команда: `docker compose up -d --no-build --wait --wait-timeout 120 bot worker`. Проверенный для текущего обновления пример — `backups/user-news-20260930/finish-independent.sh`, transient unit `newswatch-user-news-finish.service` с ExecStopPost, который повторно обеспечивает запуск. Этот одноразовый процесс не является постоянным мониторингом. Перед будущим обновлением подготовьте отдельную резервную копию, образ отката и подходящий сценарий. Для несовместимой миграции нужен отдельный порядок переключения.
+Переключение выполняет серверная systemd-задача `newswatch-deploy-<SHA>` с журналом и восстановлением предыдущего образа. Старый `newswatch-user-news-finish.service` был одноразовым историческим обновлением; повторно запускать его не нужно. Для несовместимой миграции нужен отдельный порядок переключения.
 
 Не считайте развёртывание завершённым по успешной миграции. Проверьте оба процесса running/healthy, запуск Telegram polling, регистрацию команд, чтение реального списка владельцем и отказ другому пользователю. Прерванное соединение не должно оставлять приложение остановленным.
 
@@ -61,7 +52,7 @@ docker compose logs --tail 100 bot worker
 Отредактируйте `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL` и при необходимости `LLM_BASE_URL`. После смены модели убедитесь, что поддерживается JSON schema. Обновите стоимость токенов. Примените окружение:
 
 ```sh
-docker compose up -d --force-recreate bot worker
+python3 /opt/news-watch-bot/current/deploy/reload_settings.py bot
 ```
 
 Ключ OpenRouter передаётся только в заголовке HTTPS-запроса провайдеру. Найденные страницы никогда не получают ключи, права на инструменты или исполнение команд. Для fetch разрешены только публичные HTTP(S)-адреса на портах 80/443; каждый редирект проверяется, DNS-адреса закрепляются для соединения. TLS-проверка включена.

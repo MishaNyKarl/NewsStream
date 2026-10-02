@@ -1,0 +1,6 @@
+<section class="panel"><h2>Состояние сервера</h2>{% if health.result == 'ok' %}
+<div class="metrics">{% for name, value in health.services.items() %}<article><span>{{ name }}</span><strong>{{ value.status }}</strong><small>Healthcheck: {{ value.health }} · рестартов: {{ value.restarts }}</small></article>{% endfor %}</div>
+<p>RAM: {{ health.host.memory_available_mb }} / {{ health.host.memory_total_mb }} МиБ свободно · диск: {{ health.host.disk_free_gb }} ГиБ свободно · uptime: {{ health.host.uptime_hours }} ч · load: {{ health.host.load }}</p>
+<p class="muted">Healthcheck отражает цикл процесса; доступность Telegram, поиска и LLM проверяйте по ошибкам и уведомлениям.</p>
+{% if health.operations %}<h3>Последние операции helper</h3><ul>{% for op in health.operations %}<li>{{ op.target }}: {{ op.result }} · {{ op.id }}</li>{% endfor %}</ul>{% endif %}
+{% else %}<p class="alert">Состояние bot/worker и сервера неизвестно: host helper не настроен или недоступен.</p>{% endif %}</section>

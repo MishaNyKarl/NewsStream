@@ -81,6 +81,35 @@ def test_public_state_excludes_internal_details():
                                     'revision': SHA, 'status': 'running'}
 
 
+def test_admin_compose_uses_closed_config_and_exact_revision(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, 'STATE', tmp_path / 'state')
+    (remote.STATE / SHA).mkdir(parents=True)
+    args = remote.admin_compose(tmp_path, 'newswatch-admin:' + SHA, SHA, 'up', '-d')
+    assert str(remote.ADMIN_COMPOSE_ENV) in args
+    assert 'newswatch-admin' in args
+    overrides = list((remote.STATE / SHA).glob('admin-*.yaml'))
+    assert len(overrides) == 1 and SHA in overrides[0].read_text()
+    assert 'PASSWORD' not in overrides[0].read_text()
+
+
+def test_rollback_restores_existing_admin_image(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, 'ROOT', tmp_path)
+    monkeypatch.setattr(remote, 'STATE', tmp_path / 'state')
+    monkeypatch.setattr(remote, 'RELEASES', tmp_path / 'releases')
+    (remote.STATE / SHA).mkdir(parents=True)
+    previous_source = remote.RELEASES / ('b' * 40)
+    calls, pointers = [], []
+    monkeypatch.setattr(remote, 'command', lambda args, **kwargs: calls.append(args))
+    monkeypatch.setattr(remote, 'switch_pointer', lambda source: pointers.append(source))
+    remote.restore({'revision': SHA, 'previous': {'source': str(previous_source), 'image': 'newswatch:old'},
+        'admin_started': True, 'admin_previous': {'source': str(previous_source),
+            'image': 'newswatch-admin:old', 'revision': 'b' * 40}})
+    assert len(calls) == 2 and calls[1][-1] == 'admin'
+    assert '--no-build' in calls[1]
+    assert pointers == [previous_source]
+    assert 'newswatch-admin:old' in next((remote.STATE / SHA).glob('admin-*.yaml')).read_text()
+
+
 def test_rollback_uses_previous_image_without_build(tmp_path, monkeypatch):
     monkeypatch.setattr(remote, 'ROOT', tmp_path)
     monkeypatch.setattr(remote, 'STATE', tmp_path / 'state')
