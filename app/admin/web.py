@@ -59,7 +59,9 @@ class Security:
             if message['type'] == 'http.response.start':
                 message['headers'] = list(message.get('headers', [])) + [
                     (b'cache-control', b'no-store'), (b'x-content-type-options', b'nosniff'),
-                    (b'x-frame-options', b'DENY'), (b'referrer-policy', b'no-referrer'),
+                    # no-referrer makes native form POSTs send Origin: null.
+                    # Keep same-site form provenance while hiding referrers from other sites.
+                    (b'x-frame-options', b'DENY'), (b'referrer-policy', b'same-origin'),
                     (b'content-security-policy', b"default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"),
                     (b'strict-transport-security', b'max-age=31536000'),
                     (b'permissions-policy', b'camera=(), microphone=(), geolocation=()'),

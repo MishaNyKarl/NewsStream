@@ -86,6 +86,7 @@ async def test_secure_login_rotation_logout_and_headers(admin):
     page = await client.get('/')
     assert page.status_code == 200
     assert page.headers['cache-control'] == 'no-store'
+    assert page.headers['referrer-policy'] == 'same-origin'
     assert "frame-ancestors 'none'" in page.headers['content-security-policy']
     assert 'max-age=' in page.headers['strict-transport-security']
     assert (await client.post('/logout', data={'csrf': csrf(page)})).status_code == 303
@@ -100,6 +101,7 @@ async def test_http_spoofed_proxy_host_and_csrf_are_rejected(admin):
     page = await client.get('/login')
     payload = {'csrf': csrf(page), 'username': 'admin', 'password': PASSWORD}
     assert (await client.post('/login', data=payload, headers={'Origin': 'https://evil.test'})).status_code == 403
+    assert (await client.post('/login', data=payload, headers={'Origin': 'null'})).status_code == 403
     assert (await client.post('/login', data=payload | {'csrf': 'юникод'})).status_code == 403
     assert (await client.post('/login', data=payload | {'csrf': ''})).status_code == 403
     assert (await client.post('/restart', data=payload)).status_code == 401
