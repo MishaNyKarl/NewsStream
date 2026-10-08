@@ -20,7 +20,7 @@ async def limits(session, uid, settings):
     plan = await session.get(Plan, account.plan_id) if account and account.plan_id and (
         account.expires_at is None or account.expires_at > utcnow()) else None
     result = dict(stories=settings.max_stories_per_user, manual_daily=settings.max_manual_checks_per_day,
-                  llm_daily=settings.llm_daily_call_limit, intensive_slots=1, discussion=False,
+                  llm_daily=settings.llm_daily_call_limit, intensive_slots=1, discussion=False, full_reports=False,
                   news_credits=0, check_credits=0, discussion_credits=0, plan_id=None, name='Базовый тест')
     if plan:
         result.update({k: getattr(plan, k) for k in result if k not in {'plan_id'}})
@@ -180,7 +180,7 @@ class Commerce:
             reason = payload.get('reason', '').strip()
             if not 3 <= len(reason) <= 240:
                 raise UserError('Укажите причину от 3 до 240 символов.')
-            uid = None if action == 'plan' else number('user_id', 1, 2**63-1)
+            uid = None if action in {'plan', 'plan_features'} else number('user_id', 1, 2**63-1)
             account = await self.account(session, uid) if uid else None
             detail = {'reason': reason}
             if action == 'plan':
@@ -192,10 +192,21 @@ class Commerce:
                     'news_credits': 100000, 'check_credits': 100000, 'discussion_credits': 100000,
                     'price_minor': 100000000}.items()}
                 plan = Plan(name=name, experiment=experiment, currency='RUB',
-                            discussion=payload.get('discussion') == '1', period_days=number('period_days', 1, 3650), **values)
+                            discussion=payload.get('discussion') == '1', full_reports=payload.get('full_reports') == '1',
+                            period_days=number('period_days', 1, 3650), **values)
                 session.add(plan)
                 await session.flush()
-                detail.update(plan_id=plan.id, **values)
+                detail.update(plan_id=plan.id, full_reports=plan.full_reports, **values)
+            elif action == 'plan_features':
+                plan = await session.scalar(select(Plan).where(Plan.id == number('plan_id', 1))
+                    .with_for_update(key_share=True))
+                if plan is None:
+                    raise UserError('Тариф не найден.')
+                if payload.get('full_reports') not in {'0', '1'}:
+                    raise UserError('Выберите доступ к полному отчёту.')
+                detail.update(plan_id=plan.id, before=plan.full_reports)
+                plan.full_reports = payload['full_reports'] == '1'
+                detail['full_reports'] = plan.full_reports
             elif action == 'account':
                 if account.version != number('version'):
                     raise UserError('Баланс или настройки изменились. Обновите страницу и повторите.')

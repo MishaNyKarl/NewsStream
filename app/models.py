@@ -1,7 +1,7 @@
 """Persistence models. Dates are UTC-aware on PostgreSQL and in SQLite tests."""
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, LargeBinary, String, Text, UniqueConstraint, text, true
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, LargeBinary, String, Text, UniqueConstraint, false, text, true
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -248,6 +248,7 @@ class Plan(Base):
     llm_daily: Mapped[int] = mapped_column(Integer)
     intensive_slots: Mapped[int] = mapped_column(Integer, default=1)
     discussion: Mapped[bool] = mapped_column(Boolean, default=False)
+    full_reports: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
     discussion_credits: Mapped[int] = mapped_column(Integer, default=0)
     news_credits: Mapped[int] = mapped_column(Integer, default=0)
     check_credits: Mapped[int] = mapped_column(Integer, default=0)
@@ -369,3 +370,13 @@ class AnnouncementDelivery(Base):
     sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     message_id: Mapped[int | None] = mapped_column(BigInteger)
     error: Mapped[str | None] = mapped_column(String(64))
+
+
+class ReportControl(Base):
+    __tablename__ = 'report_controls'
+    __table_args__ = (CheckConstraint('id = 1', name='ck_report_controls_singleton'),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    values: Mapped[dict] = mapped_column(JSON)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    updated_by: Mapped[str] = mapped_column(String(80))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

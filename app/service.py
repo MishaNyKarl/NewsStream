@@ -1,5 +1,6 @@
 """Application boundary: ownership, usage budgets and the monitoring workflow."""
 import asyncio
+from copy import copy
 import hmac
 import json
 import logging
@@ -20,6 +21,7 @@ from app.search.client import SearchClient
 from app.search.dedupe import content_hash, is_near_duplicate, normalize_url
 from app.search.planning import diverse_results, plan_queries, publisher, source_cutoff
 from app.progress import CheckMetrics, CheckOutcome, progress_context, report
+from app.report_controls import DEFAULTS, ReportControls
 
 log = logging.getLogger(__name__)
 credit_context: ContextVar[str | None] = ContextVar('credit_context', default=None)
@@ -33,6 +35,7 @@ class BotService:
         self.settings = settings
         self.repo = repo or Repository(settings)
         self.commerce = Commerce(self.repo.session_factory, settings) if isinstance(self.repo, Repository) else None
+        self.report_controls = ReportControls(self.repo.session_factory) if isinstance(self.repo, Repository) else None
         self.ai = ai or AIClient(settings, self._usage)
         self.search = search or SearchClient(settings, self._usage)
         self.fetcher = fetcher or ContentFetcher()
@@ -273,7 +276,16 @@ class BotService:
                 except Exception as exc:
                     await self._error('check_status', exc, story_id=story.id, user_id=story.user_id)
 
-    async def _candidates(self, story, metrics=None):
+    async def report_options(self):
+        if self.report_controls:
+            return (await self.report_controls.snapshot(self.settings))['values']
+        return dict(DEFAULTS, search_queries=self.settings.max_search_queries_per_story,
+                    source_reads=self.settings.max_source_reads_per_check, analysis_sources=self.settings.max_sources_per_check)
+
+    async def _candidates(self, story, metrics=None, options=None):
+        options = options or await self.report_options()
+        search_settings = copy(self.settings)
+        search_settings.max_search_queries_per_story = options['search_queries']
         metrics = metrics if metrics is not None else CheckMetrics()
         known = await self.repo.known_sources(story.id)
         known_urls = await self.repo.known_url_set(story.id)
@@ -282,7 +294,7 @@ class BotService:
         excerpts = [source.content_excerpt for source in known if source.content_excerpt]
         results = []
         successful_queries = 0
-        queries = plan_queries(story, self.settings)
+        queries = plan_queries(story, search_settings)
         for number, query in enumerate(queries, 1):
             await report('searching', current=number, total=len(queries), results=len(results))
             try:
@@ -326,7 +338,7 @@ class BotService:
         reads = 0
         seen_titles = set()
         for result in diverse_results(list(unique.values()), utc(story.created_at)):
-            if reads >= max(1, min(12, self.settings.max_source_reads_per_check)):
+            if reads >= options['source_reads']:
                 break
             normalized = normalize_url(result.url)
             previous = known_by_url.get(normalized)
@@ -377,7 +389,7 @@ class BotService:
         # Preserve publisher ordering within each group, and prefer actual
         # article bodies over headlines when the analysis budget is full.
         pool.sort(key=lambda candidate: not candidate.full_text)
-        candidates = pool[:max(1, min(6, self.settings.max_sources_per_check))]
+        candidates = pool[:options['analysis_sources']]
         metrics.full_texts = sum(candidate.full_text for candidate in candidates)
         metrics.snippets = len(candidates) - metrics.full_texts
         metrics.before_subscription = sum(candidate.published_at is not None and
@@ -403,13 +415,15 @@ class BotService:
             await report('queued')
             async with self._checks:
                 async with asyncio.timeout(600):
-                    candidates = await self._candidates(story, metrics=metrics)
+                    options = await self.report_options()
+                    candidates = await self._candidates(story, metrics=metrics, options=options)
                     analysis = None
                     if candidates:
                         await report('analyzing', sources=len(candidates))
                         context = {key: getattr(story, key) for key in ['title','current_state','watch_goals','entities','keywords']}
                         context['monitoring_started_at'] = utc(story.created_at).isoformat()
                         context['now'] = datetime.now(timezone.utc).isoformat()
+                        context['_report_controls'] = options
                         history = await self.repo.recent_updates(story.user_id, story.id)
                         context['known_facts'] = [fact for update in history if not update.is_demo for fact in update.new_facts]
                         analysis = await self.ai.analyze(context, candidates)
@@ -468,6 +482,18 @@ class BotService:
         value = await self.commerce.snapshot(user_id)
         entries = await self.commerce.credit_history(user_id) if view == 'history' else ()
         return account_screen(value, view, entries)
+
+    async def full_reports_allowed(self, user_id):
+        return bool((await self.commerce.snapshot(user_id))['limits']['full_reports'])
+
+    async def get_full_update(self, user_id, update_id):
+        pair = await self.repo.get_full_update(user_id, update_id)
+        if pair is None:
+            return None
+        if not await self.full_reports_allowed(user_id):
+            raise UserError('Полный отчёт доступен в подписке с функцией «Читать дальше». '
+                            'Выберите подходящий тариф в каталоге.')
+        return pair
 
     async def discuss(self, user_id, story_id, question):
         story = await self.repo.get_story(user_id, story_id)

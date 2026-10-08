@@ -74,6 +74,8 @@ class Harness:
         self.service = SimpleNamespace(
             authorize=AsyncMock(return_value=SimpleNamespace(telegram_id=100) if authorized else None),
             is_admin=AsyncMock(return_value=False), provider_ready=lambda: True,
+            full_reports_allowed=AsyncMock(return_value=True),
+            report_options=AsyncMock(return_value={'preview_words': 120, 'full_words': 0}),
             prepare_story=AsyncMock(return_value=story(status="draft")),
             save_user_news=AsyncMock(return_value=news(status='pending')),
             process_user_news=AsyncMock(return_value=news()),
@@ -90,6 +92,11 @@ class Harness:
                 report_preference=AsyncMock(return_value=None), set_report_time=AsyncMock(),
                 get_full_update=AsyncMock(return_value=(change(), story()))),
         )
+        async def full_update(uid, update_id):
+            if not await self.service.full_reports_allowed(uid):
+                raise UserError('Полный отчёт доступен в подписке.')
+            return await self.service.repo.get_full_update(uid, update_id)
+        self.service.get_full_update = full_update
         self.settings = SimpleNamespace(default_check_interval_hours=24, max_stories_per_user=10,
                                         max_manual_checks_per_day=5, manual_check_cooldown_seconds=120,
                                         invite_code="tester_invite", admin_claim_token="SUPER_SECRET_ADMIN_CLAIM")

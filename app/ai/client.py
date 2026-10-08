@@ -7,6 +7,7 @@ import aiohttp
 from pydantic import ValidationError, BaseModel, Field
 
 from app.ai.prompts import ANALYZE, EXTRACT, VERIFY
+from app.report_controls import clip_words
 from app.domain import Analysis, Candidate, ProviderUnavailable, ReviewedAnalysis, StoryExtraction
 from app.progress import report
 
@@ -206,7 +207,14 @@ class AIClient:
     async def analyze(self, story: dict, sources: list[Candidate]) -> Analysis:
         if not sources:
             raise ProviderUnavailable('Нет доступных новых источников для анализа.')
-        selected = sources[:max(1, min(6, self.settings.max_sources_per_check))]
+        options = story.get('_report_controls') or {}
+        def bounded(key, default, low, high):
+            value = options.get(key, default)
+            return max(low, min(high, value)) if isinstance(value, int) and not isinstance(value, bool) else default
+        selected = sources[:bounded('analysis_sources', max(1, min(6, self.settings.max_sources_per_check)), 1, 6)]
+        source_words = bounded('source_words', 0, 0, 1500)
+        preview_words = bounded('preview_words', 120, 20, 300)
+        style = f'\nnotification_summary: краткое содержание по-русски, не более {preview_words} слов. Не теряй существенные факты.'
         allowed_urls = {source.url for source in selected}
         story_data = {key: story.get(key) for key in
                       ('title', 'current_state', 'watch_goals', 'known_facts', 'last_checked_at',
@@ -218,7 +226,7 @@ class AIClient:
                 story_data[key] = value.isoformat()
         source_data = [{
             'url': s.url, 'publisher_domain': s.domain, 'title': s.title[:400],
-            'content': s.content_excerpt[:4500],
+            'content': clip_words(s.content_excerpt[:4500], source_words),
             'published_at': s.published_at.isoformat() if s.published_at else None,
             'full_text_verified': s.full_text,
         } for s in selected]
@@ -232,7 +240,7 @@ class AIClient:
             if any(not fact.strip() or len(fact) > 500 for fact in result.new_facts):
                 raise ValueError('Invalid fact')
 
-        result = await self._complete(ANALYZE, {'story': story_data, 'sources': source_data,
+        result = await self._complete(ANALYZE + style, {'story': story_data, 'sources': source_data,
             'current_time_utc': datetime.now(timezone.utc).isoformat()},
             Analysis, 'analyze', validate)
         if not (result.meaningful_update and result.relevant and result.novelty_score >= .65
@@ -268,7 +276,7 @@ class AIClient:
         # The editor checks support and attribution, not a second, narrower
         # relevance decision based on possibly over-specific original goals.
         review_story = {key: value for key, value in story_data.items() if key != 'watch_goals'}
-        reviewed = await self._complete(VERIFY, {'story': review_story, 'sources': review_sources,
+        reviewed = await self._complete(VERIFY + style, {'story': review_story, 'sources': review_sources,
             'proposal': result.model_dump()}, ReviewedAnalysis, 'verify', validate_review)
         return Analysis.model_validate(reviewed.model_dump(exclude={'evidence'}))
 

@@ -15,6 +15,7 @@ from app.domain import UserError
 from app.bot import build_router
 from app.journal import DATE_PROMPT, JournalWindow, date_window, parse_journal_callback, preset_window
 from app.models import Base, StoryUpdate, utcnow
+from app.service import BotService
 from test_bot import Harness, NOW, change, story
 from test_repository import active, store as store
 from test_progress import service_with_results
@@ -206,7 +207,7 @@ async def test_journal_router_service_database_roundtrip_works_without_llm(store
     pending, _ = (await repo.pending_notifications())[0]
     await repo.mark_notified(update.id, True, delivery_token=pending.delivery_lock_token, telegram_message_id=1234)
     service = service_with_results()
-    service.repo = repo
+    service = BotService(service.settings, repo, service.ai, service.search, service.fetcher)
     service.provider_ready = lambda: False
     harness = Harness()
     harness.router = build_router(service, harness.settings)

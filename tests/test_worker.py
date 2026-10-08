@@ -8,6 +8,7 @@ def state():
     update=SimpleNamespace(id=2,summary='New fact',reason='Official confirmation',source_urls=['https://example.org/news'],
         is_demo=False,delivery_lock_token='lease')
     service=SimpleNamespace(repo=AsyncMock(),_error=AsyncMock())
+    service.repo.session_factory = None  # This fixture has no database runtime settings.
     service.repo.pending_notifications.return_value=[(update,story)]
     service.repo.get_story.return_value=story
     bot=AsyncMock()

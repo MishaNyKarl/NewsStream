@@ -34,6 +34,7 @@ from app.errors import UserError
 from app.models import Plan, UserProfile
 from app.admin.people import directory, event_name
 from app.announcements import Announcements, AUDIENCES, BUTTONS, STATUSES, TEMPLATES, announcement_text
+from app.report_controls import ReportControls, FIELDS as REPORT_FIELDS, DEFAULTS as REPORT_DEFAULTS, clip_words
 
 COOKIE = '__Host-newswatch-admin'
 ROOT = Path(__file__).parent
@@ -41,6 +42,7 @@ TITLES = {'/': 'Обзор', '/users': 'Пользователи', '/stories': '
           '/analytics': 'Аналитика продукта',
           '/commerce': 'Тарифы и кредиты',
           '/announcements': 'Оповещения',
+          '/report-settings': 'Отчёты и поиск',
           '/access': 'Доступ к панели',
           '/checks': 'Проверки', '/errors': 'Ошибки', '/notifications': 'Уведомления',
           '/calculator': 'Калькулятор', '/project': 'Проект и сервер', '/docs': 'Документация', '/audit': 'Журнал действий'}
@@ -121,6 +123,7 @@ def create_app(config=None, data=None, ops=None):
     commerce = Commerce(commerce_data.sessions, SimpleNamespace(
         max_stories_per_user=10, max_manual_checks_per_day=5, llm_daily_call_limit=250))
     announcements = Announcements(commerce_data.sessions)
+    report_controls = ReportControls(commerce_data.sessions)
     ops = ops or Ops(config.ops_socket)
     login_lock = asyncio.Lock()  # At most one 64 MiB Argon2 operation in flight.
     templates = Environment(loader=FileSystemLoader(ROOT/'templates'), autoescape=select_autoescape())
@@ -394,6 +397,37 @@ def create_app(config=None, data=None, ops=None):
         except ValueError:
             return render(request, 'message.html', status=400, message='Некорректное число. Вернитесь и проверьте поля.')
 
+    async def report_settings_page(request):
+        try:
+            snapshot = await report_controls.snapshot()
+            previewing = False
+            if request.method == 'POST':
+                values = await form(request)
+                action = values.get('action')
+                if action == 'preview':
+                    snapshot['values'] = report_controls.validate(values)
+                    previewing = True
+                elif action in {'save', 'defaults'}:
+                    if action == 'defaults':
+                        values.update({name: str(value) for name, value in REPORT_DEFAULTS.items()})
+                    await report_controls.save(values, actor(request), values.get('key', ''))
+                    state.audit(actor(request), 'report_controls_change', result='ok')
+                    return RedirectResponse('/report-settings', 303)
+                else:
+                    raise UserError('Неизвестное действие.')
+            sample = ('Город подтвердил открытие новой станции метро в декабре. '
+                'Строительные работы завершены, сейчас проверяют оборудование и безопасность. '
+                'Окончательную дату объявят после приёмки. ' * 12).strip()
+            options = snapshot['values']
+            return render(request, 'report_settings.html', snapshot=snapshot, fields=REPORT_FIELDS,
+                preview=clip_words(sample, options['preview_words'] // 2),
+                digest=clip_words(sample, options['digest_words']),
+                full=clip_words(sample, options['full_words']), previewing=previewing, key=str(uuid4()))
+        except (ValueError, UserError) as exc:
+            raise HTTPException(400, str(exc) if isinstance(exc, UserError) else 'Некорректные параметры.') from None
+        except SQLAlchemyError:
+            raise HTTPException(503, 'Настройки временно недоступны.') from None
+
     async def announcements_page(request):
         try:
             if request.method == 'POST':
@@ -490,6 +524,7 @@ def create_app(config=None, data=None, ops=None):
               Route('/analytics', analytics), Route('/analytics.csv', analytics),
               Route('/commerce', commerce_page, methods=['GET', 'POST']),
               Route('/announcements', announcements_page, methods=['GET', 'POST']),
+              Route('/report-settings', report_settings_page, methods=['GET', 'POST']),
               Route('/users/{uid:int}/avatar', avatar),
               Route('/access', access_page, methods=['GET', 'POST']),
               Route('/restart', restart, methods=['POST']), Route('/docs', docs), Route('/audit', audit),

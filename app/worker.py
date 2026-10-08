@@ -12,8 +12,17 @@ from app.daily_reports import REPORT_PROMPT, report_keyboard
 from app.journal import MSK
 from app.navigation import with_home
 from app.announcements import Announcements, announcement_text
+from app.report_controls import DEFAULTS, ReportControls, clip_words
 
 log = logging.getLogger(__name__)
+
+
+async def display_options(service, uid):
+    commerce = getattr(service, 'commerce', None)
+    enabled = bool((await commerce.snapshot(uid))['limits'].get('full_reports', False)) if commerce else False
+    sessions = getattr(service.repo, 'session_factory', None)
+    options = (await ReportControls(sessions).snapshot())['values'] if sessions else dict(DEFAULTS)
+    return enabled, options
 
 async def deliver_news_ready(service, bot):
     for item in await service.repo.pending_news_notices():
@@ -46,8 +55,9 @@ async def deliver_notifications(service, bot):
             if fresh and fresh.status == 'active' and (
                 getattr(fresh, 'monitoring_mode', 'intensive') == 'intensive' or getattr(update, 'is_demo', False)
             ):
-                message = await bot.send_message(story.user_id, notification_text(story, update),
-                    reply_markup=notification_keyboard(story, update), request_timeout=30)
+                enabled, options = await display_options(service, story.user_id)
+                message = await bot.send_message(story.user_id, notification_text(story, update, options['preview_words']),
+                    reply_markup=notification_keyboard(story, update, full_reports=enabled), request_timeout=30)
                 message_id = message.message_id
                 success = True
         except TelegramForbiddenError:
@@ -61,7 +71,7 @@ async def deliver_notifications(service, bot):
                                         telegram_message_id=message_id)
 
 
-def daily_report_page(entries, cutoff, index, count):
+def daily_report_page(entries, cutoff, index, count, full_reports=False, word_limit=40):
     heading = f'🗓 <b>Ежедневный отчёт · {cutoff.astimezone(MSK):%d.%m.%Y}</b>'
     if count > 1:
         heading += f' · {index}/{count}'
@@ -72,10 +82,10 @@ def daily_report_page(entries, cutoff, index, count):
         if updates:
             for item in updates[-2:]:
                 label = 'Уточнение' if item['kind'] == 'context' else 'Новое'
-                lines.append(f'• {label}: {escaped(item["summary"], 200)}')
+                lines.append(f'• {label}: {escaped(clip_words(item["summary"], word_limit), 350)}')
             if len(updates) > 2:
                 lines.append(f'Ещё обновлений: {len(updates) - 2}. Все — в истории новости.')
-            rows.append([InlineKeyboardButton(text=f'📖 Читать дальше · {entry["title"][:40]}',
+            rows.append([InlineKeyboardButton(text=f'{"📖 Читать дальше" if full_reports else "🔒 Полный отчёт · подписка"} · {entry["title"][:30]}',
                         callback_data=f'full:{updates[-1]["id"]}')])
             rows.append([InlineKeyboardButton(text='🕒 Все обновления этой новости',
                         callback_data=f'history:{entry["story_id"]}')])
@@ -99,7 +109,8 @@ async def deliver_daily_reports(service, bot):
                     entries.append(entry)
             message_id = None
             if entries:
-                text, keyboard = daily_report_page(entries, pref.cutoff, index+1, len(chunks))
+                enabled, options = await display_options(service, pref.user_id)
+                text, keyboard = daily_report_page(entries, pref.cutoff, index+1, len(chunks), enabled, options['digest_words'])
                 message = await bot.send_message(pref.user_id, text, parse_mode='HTML',
                     reply_markup=keyboard, disable_web_page_preview=True, request_timeout=30)
                 message_id = message.message_id

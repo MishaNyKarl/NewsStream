@@ -27,6 +27,7 @@ from app.telegram_input import AlbumMiddleware, extract_story_input
 from app.product_analytics import interaction_category
 from app.account_ui import account_keyboard
 from app.daily_reports import REPORT_PROMPT, report_keyboard
+from app.report_controls import clip_words
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_UNITS = 3900
@@ -105,7 +106,7 @@ def _keyboard(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
     return with_home(rows)
 
 
-def notification_text(story: Any, update: Any) -> str:
+def notification_text(story: Any, update: Any, word_limit=120) -> str:
     demo = bool(getattr(update, "is_demo", False))
     context_only = getattr(update, "update_kind", "development") == "context"
     heading = "🧪 Демонстрационное обновление" if demo else (
@@ -116,18 +117,22 @@ def notification_text(story: Any, update: Any) -> str:
     elif context_only:
         parts.append("Нашёл важные сведения, которых не было в исходной карточке. Их появление после подписки не подтверждено.")
     label = "Что уточнилось" if context_only and not demo else "Что нового"
-    parts.append(f"<b>{label}</b>\n" + escaped(update.summary, 650))
-    facts = _bullets(getattr(update, "new_facts", []), 3, 170)
+    summary_budget = max(1, word_limit // 2)
+    fact_budget = max(1, word_limit // 10)
+    reason_budget = max(1, word_limit - summary_budget - 3 * fact_budget)
+    parts.append(f"<b>{label}</b>\n" + escaped(clip_words(update.summary, summary_budget), 800))
+    facts = _bullets([clip_words(fact, fact_budget) for fact in (getattr(update, 'new_facts', None) or [])], 3, 170)
     if facts:
         parts.append(facts)
     if getattr(update, "reason", None):
-        parts.append("<b>Почему это важно</b>\n" + escaped(update.reason, 300))
+        parts.append("<b>Почему это важно</b>\n" + escaped(clip_words(update.reason, reason_budget), 300))
     parts.append(_source_lines(update))
     return "\n\n".join(parts)
 
 
-def notification_keyboard(story: Any, update: Any) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [[_button("📖 Читать дальше", "full", update.id)]]
+def notification_keyboard(story: Any, update: Any, full_reports=False) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [[_button(
+        '📖 Читать дальше' if full_reports else '🔒 Читать дальше · подписка', 'full', update.id)]]
     sources = _sources(update)
     if sources:
         rows.append([InlineKeyboardButton(text="↗ Открыть источник", url=sources[0])])
@@ -141,7 +146,7 @@ def notification_keyboard(story: Any, update: Any) -> InlineKeyboardMarkup:
     return _keyboard(*rows)
 
 
-def full_update_pages(story, update):
+def full_update_pages(story, update, word_limit=0):
     """Escape chunks independently, preserving every stored character and fact."""
     context = getattr(update, 'update_kind', 'development') == 'context'
     lines = ['📖 Полный отчёт о новости', story.title]
@@ -159,6 +164,9 @@ def full_update_pages(story, update):
     if sources:
         lines.extend(['Источники', *sources])
     text = '\n\n'.join(str(line) for line in lines)
+    if word_limit and len(text.split()) > word_limit:
+        text = clip_words(text, word_limit) + '\n\nОбъём ограничен настройкой отчёта. Ссылки на источники:' + (
+            '\n' + '\n'.join(sources) if sources else ' недоступны.')
     pages, current, units = [], [], 0
     for char in text:
         if ord(char) < 32 and char not in '\n\t':
@@ -461,6 +469,7 @@ def build_router(service: Any, settings: Any) -> Router:
             parsed = urlsplit(url)
             if parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password and not any(c.isspace() for c in url):
                 rows.append([InlineKeyboardButton(text='🌐 Открыть админку', url=url)])
+                rows.append([InlineKeyboardButton(text='📝 Отчёты и поиск', url=url.rstrip('/') + '/report-settings')])
         except ValueError:
             pass
         return _keyboard(*rows)
@@ -693,8 +702,10 @@ def build_router(service: Any, settings: Any) -> Router:
             return
         update, story = item
         await query.answer()
-        text = f'🗂 Отправлено: {_date(update.notified_at)}\n\n' + notification_text(story, update)
-        rows = list(notification_keyboard(story, update).inline_keyboard)
+        options = await service.report_options()
+        text = f'🗂 Отправлено: {_date(update.notified_at)}\n\n' + notification_text(story, update, options['preview_words'])
+        rows = list(notification_keyboard(story, update,
+            full_reports=await service.full_reports_allowed(query.from_user.id)).inline_keyboard)
         rows = [[b for b in row if b.callback_data not in {'jp:week', 'menu:0'}] for row in rows]
         rows = [row for row in rows if row]
         rows.append([_button('📋 Открыть тему', 'story', story.id)])
@@ -919,6 +930,7 @@ def build_router(service: Any, settings: Any) -> Router:
                     f'Тем одновременно: {plan.stories}\nСрочных тем: {plan.intensive_slots}\n'
                     f'Ручных проверок в сутки: {plan.manual_daily}\n'
                     f'Обсуждение: {"включено" if plan.discussion else "не включено"}\n\n'
+                    f'📖 Полный отчёт («Читать дальше»): {"включён" if plan.full_reports else "не включён"}\n\n'
                     f'Кредиты за действие: разбор {plan.news_credits}, проверка {plan.check_credits}, '
                     f'обсуждение {plan.discussion_credits}.\n\nОнлайн-оплата пока в разработке.', _keyboard(
                     [InlineKeyboardButton(text='🛒 Купить — скоро', callback_data='purchase:stub')],
@@ -943,12 +955,19 @@ def build_router(service: Any, settings: Any) -> Router:
         full_match = re.fullmatch(r'full:([1-9][0-9]{0,9})', query.data or '')
         if full_match:
             await query.answer()
-            pair = await service.repo.get_full_update(query.from_user.id, int(full_match[1]))
+            try:
+                pair = await service.get_full_update(query.from_user.id, int(full_match[1]))
+            except UserError as exc:
+                await _answer(query.message, '🔒 <b>Полный отчёт — функция подписки</b>\n\n' + escaped(str(exc), 1000),
+                    _keyboard([InlineKeyboardButton(text='💎 Выбрать тариф', callback_data='shop:home')],
+                              [InlineKeyboardButton(text='💎 Мой тариф', callback_data='account:home')]))
+                return
             if pair is None:
                 await _answer(query.message, 'Обновление удалено или недоступно.')
                 return
             update, story = pair
-            pages = full_update_pages(story, update)
+            options = await service.report_options()
+            pages = full_update_pages(story, update, options['full_words'])
             for index, page in enumerate(pages, 1):
                 prefix = f'📄 {index}/{len(pages)}\n\n' if len(pages) > 1 else ''
                 await _answer(query.message, prefix + page,
@@ -1151,7 +1170,9 @@ def build_router(service: Any, settings: Any) -> Router:
             else:
                 await _answer(message, f"🕒 <b>Последние обновления</b>\n{escaped(story.title, 180)}")
                 for update in updates[:5]:
-                    await _answer(message, _date(update.created_at) + "\n\n" + notification_text(story, update), notification_keyboard(story, update))
+                    options = await service.report_options()
+                    await _answer(message, _date(update.created_at) + "\n\n" + notification_text(story, update, options['preview_words']),
+                        notification_keyboard(story, update, full_reports=await service.full_reports_allowed(user_id)))
 
     @router.message(Command('account'), ~F.forward_origin)
     async def account_command(message: Message):
