@@ -43,6 +43,7 @@ async def main(role='bot'):
                     BotCommand(command='news', description='Новости пользователя'),
                     BotCommand(command='watching', description='Мои наблюдения'),
                     BotCommand(command='journal', description='Журнал уведомлений'),
+                    BotCommand(command='report', description='Время ежедневного отчёта'),
                     BotCommand(command='interests', description='Мои интересы'),
                     BotCommand(command='account', description='💎 Подписка и кредиты'),
                     BotCommand(command='check_now', description='Проверить сюжет'),

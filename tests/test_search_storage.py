@@ -17,6 +17,7 @@ async def test_pre_subscription_evidence_is_stored_as_context_not_new_event(stor
     repo, _, _ = store
     item = await active(repo)
     claim = await repo.claim_story(item.id)
+    await repo.set_monitoring_mode(item.user_id, item.id, 'intensive')
     source = replace(candidate(), published_at=item.created_at + timedelta(hours=hours) if hours is not None else None)
     update = await repo.save_check(item.id, claim.lock_token, [source], analysis())
     assert update.update_kind == kind
@@ -30,6 +31,7 @@ async def test_changed_article_same_url_updates_source_and_emits_once(store):
     repo, _, _ = store
     item = await active(repo)
     claim = await repo.claim_story(item.id)
+    await repo.set_monitoring_mode(item.user_id, item.id, 'intensive')
     original = candidate()
     assert await repo.save_check(item.id, claim.lock_token, [original], analysis(False)) is None
     revised = replace(original, content_hash='updated-body', content_excerpt='Confirmed landing. All passengers safe.')

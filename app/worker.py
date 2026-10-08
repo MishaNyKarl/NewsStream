@@ -5,9 +5,12 @@ import tempfile
 from pathlib import Path
 
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import ReplyParameters
-from app.bot import notification_text, notification_keyboard
+from aiogram.types import InlineKeyboardButton, ReplyParameters
+from app.bot import escaped, notification_text, notification_keyboard
 from app.user_news import ready_text, keyboard as news_keyboard
+from app.daily_reports import REPORT_PROMPT, report_keyboard
+from app.journal import MSK
+from app.navigation import with_home
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +42,9 @@ async def deliver_notifications(service, bot):
         try:
             # Recheck immediately before delivering to respect pause/delete.
             fresh = await service.repo.get_story(story.user_id, story.id)
-            if fresh and fresh.status == 'active':
+            if fresh and fresh.status == 'active' and (
+                getattr(fresh, 'monitoring_mode', 'intensive') == 'intensive' or getattr(update, 'is_demo', False)
+            ):
                 message = await bot.send_message(story.user_id, notification_text(story, update),
                     reply_markup=notification_keyboard(story, update), request_timeout=30)
                 message_id = message.message_id
@@ -54,6 +59,77 @@ async def deliver_notifications(service, bot):
         await service.repo.mark_notified(update.id, success, delivery_token=update.delivery_lock_token,
                                         telegram_message_id=message_id)
 
+
+def daily_report_page(entries, cutoff, index, count):
+    heading = f'🗓 <b>Ежедневный отчёт · {cutoff.astimezone(MSK):%d.%m.%Y}</b>'
+    if count > 1:
+        heading += f' · {index}/{count}'
+    lines, rows = [heading], []
+    for entry in entries:
+        lines.append(f'<b>{escaped(entry["title"], 160)}</b>')
+        updates = entry['updates']
+        if updates:
+            for item in updates[-2:]:
+                label = 'Уточнение' if item['kind'] == 'context' else 'Новое'
+                lines.append(f'• {label}: {escaped(item["summary"], 200)}')
+            if len(updates) > 2:
+                lines.append(f'Ещё обновлений: {len(updates) - 2}. Все — в истории новости.')
+            rows.append([InlineKeyboardButton(text=f'📖 Читать дальше · {entry["title"][:40]}',
+                        callback_data=f'full:{updates[-1]["id"]}')])
+            rows.append([InlineKeyboardButton(text='🕒 Все обновления этой новости',
+                        callback_data=f'history:{entry["story_id"]}')])
+        else:
+            lines.append('— Без изменений' if entry['checked'] else '⏳ Нет свежей проверки')
+    lines.append('Время отчёта по Москве: /report')
+    return '\n\n'.join(lines), with_home(rows)
+
+
+async def deliver_daily_reports(service, bot):
+    pref = await service.repo.claim_daily_report()
+    if pref is None:
+        return
+    try:
+        chunks = [pref.payload[i:i+3] for i in range(0, len(pref.payload), 3)]
+        for index in range(pref.sent_parts, len(chunks)):
+            entries = []
+            for entry in chunks[index]:
+                fresh = await service.repo.get_story(pref.user_id, entry['story_id'])
+                if fresh and fresh.status == 'active' and fresh.monitoring_mode == 'daily':
+                    entries.append(entry)
+            message_id = None
+            if entries:
+                text, keyboard = daily_report_page(entries, pref.cutoff, index+1, len(chunks))
+                message = await bot.send_message(pref.user_id, text, parse_mode='HTML',
+                    reply_markup=keyboard, disable_web_page_preview=True, request_timeout=30)
+                message_id = message.message_id
+            saved = await service.repo.advance_daily_report(pref.user_id, pref.token, sent_parts=index+1,
+                update_ids=[u['id'] for e in entries for u in e['updates']], message_id=message_id)
+            if not saved:
+                return
+        await service.repo.advance_daily_report(pref.user_id, pref.token)
+    except TelegramForbiddenError:
+        await service.repo.advance_daily_report(pref.user_id, pref.token, forbidden=True)
+    except TelegramRetryAfter as exc:
+        await service.repo.advance_daily_report(pref.user_id, pref.token, retry_after=exc.retry_after)
+    except Exception as exc:
+        await service.repo.advance_daily_report(pref.user_id, pref.token, retry_after=60)
+        await service._error('daily_report', exc, user_id=pref.user_id)
+
+
+async def deliver_report_prompt(service, bot):
+    owner = await service.repo.claim_report_prompt()
+    if owner is None:
+        return
+    try:
+        await bot.send_message(owner, REPORT_PROMPT, reply_markup=report_keyboard(), request_timeout=30)
+    except TelegramForbiddenError:
+        for story in await service.repo.list_stories(owner):
+            if story.status == 'active' and story.monitoring_mode == 'daily':
+                await service.repo.set_status(owner, story.id, 'paused', reason='delivery_forbidden')
+    except Exception:
+        await service.repo.reset_report_prompt(owner)
+        raise
+
 async def run_worker(service, bot):
     heartbeat = Path(tempfile.gettempdir()) / 'newswatch-worker-heartbeat'
     check_tasks: set[asyncio.Task] = set()
@@ -63,6 +139,8 @@ async def run_worker(service, bot):
             try:
                 await deliver_notifications(service, bot)
                 await deliver_news_ready(service, bot)
+                await deliver_report_prompt(service, bot)
+                await deliver_daily_reports(service, bot)
                 if service.provider_ready() and len(check_tasks) < 2:
                     for story_id in await service.repo.due_story_ids(limit=2-len(check_tasks)):
                         story = await service.repo.claim_story(story_id)

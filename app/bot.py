@@ -25,6 +25,7 @@ from app.telegram_progress import ProgressEditBudget, TelegramProgress
 from app.telegram_input import AlbumMiddleware, extract_story_input
 from app.product_analytics import interaction_category
 from app.account_ui import account_keyboard
+from app.daily_reports import REPORT_PROMPT, report_keyboard
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_UNITS = 3900
@@ -32,7 +33,8 @@ DENIED = "Это закрытый тест. Попросите организа�
 UNEXPECTED = "Не получилось завершить действие. Попробуйте чуть позже. Ваши наблюдения сохранены."
 INTENSIVE_HELP = (
     "⚡ «Следить внимательнее»: проверки через 30 мин, 1, 2, 4, 8, 12 и 24 ч от включения. "
-    "Затем — обычное расписание. Количество срочных тем зависит от вашего тарифа: /account."
+    "Важные изменения присылаю сразу после проверки. Затем — ежедневный отчёт. "
+    "Количество срочных тем зависит от вашего тарифа: /account."
 )
 
 
@@ -124,7 +126,7 @@ def notification_text(story: Any, update: Any) -> str:
 
 
 def notification_keyboard(story: Any, update: Any) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    rows: list[list[InlineKeyboardButton]] = [[_button("📖 Читать дальше", "full", update.id)]]
     sources = _sources(update)
     if sources:
         rows.append([InlineKeyboardButton(text="↗ Открыть источник", url=sources[0])])
@@ -138,19 +140,57 @@ def notification_keyboard(story: Any, update: Any) -> InlineKeyboardMarkup:
     return _keyboard(*rows)
 
 
+def full_update_pages(story, update):
+    """Escape chunks independently, preserving every stored character and fact."""
+    context = getattr(update, 'update_kind', 'development') == 'context'
+    lines = ['📖 Полный отчёт о новости', story.title]
+    if getattr(update, 'is_demo', False):
+        lines.append('🧪 Демонстрация: это тестовое сообщение, не реальная новость.')
+    elif context:
+        lines.append('Уточнение исходной новости. Появление сведений после подписки не подтверждено.')
+    lines.extend(['Что уточнилось' if context else 'Что нового', update.summary])
+    lines.extend('• ' + str(fact) for fact in (getattr(update, 'new_facts', None) or []))
+    if getattr(update, 'reason', None):
+        lines.extend(['Почему это важно', update.reason])
+    if getattr(update, 'new_state', None):
+        lines.extend(['Что известно сейчас', update.new_state])
+    sources = [url for url in (getattr(update, 'source_urls', None) or []) if safe_url(url)]
+    if sources:
+        lines.extend(['Источники', *sources])
+    text = '\n\n'.join(str(line) for line in lines)
+    pages, current, units = [], [], 0
+    for char in text:
+        if ord(char) < 32 and char not in '\n\t':
+            continue
+        part = html.escape(char, quote=True)
+        size = _units(part)
+        if units + size > 3500:
+            # Prefer a word boundary near the end; keep whitespace in the output.
+            boundary = next((i + 1 for i in range(len(current) - 1, max(-1, len(current) - 400), -1)
+                             if current[i] in {' ', '\n', '\t'}), len(current))
+            pages.append(''.join(current[:boundary]))
+            current = current[boundary:]
+            units = sum(_units(value) for value in current)
+        current.append(part)
+        units += size
+    if current:
+        pages.append(''.join(current))
+    return pages
+
+
 def preview_text(story: Any) -> str:
     return (
         f"📰 <b>{escaped(story.title, 180)}</b>\n\n"
         f"<b>Что произошло</b>\n{escaped(story.summary, 850)}\n\n"
         f"<b>Буду отслеживать</b>\n{_bullets(story.watch_goals, 5, 250)}\n\n"
         "Проверьте, верно ли я понял сюжет. Выберите действие:\n\n"
-        f"Обычный — первая проверка после подписки, затем каждые {int(story.check_frequency_hours)} ч.\n\n"
+        "Ежедневный отчёт — все обычные подписки в одном сообщении в выбранное время. Без изменений — прочерк.\n\n"
         + INTENSIVE_HELP + "\n\n⭐ «Просто интересна тема» — сохранить интерес без наблюдения."
     )
 
 
 def preview_keyboard(story: Any) -> InlineKeyboardMarkup:
-    rows = [[_button("✅ Следить", "watch", story.id)],
+    rows = [[_button("🗓 В ежедневный отчёт", "watch", story.id)],
             [_button("⚡ Следить внимательнее", "focus", story.id)],
             [_button("⭐ Просто интересна тема", "interest", story.id)],
             [_button("❌ Отмена", "cancel", story.id)]]
@@ -164,8 +204,8 @@ def story_text(story: Any) -> str:
     status = {"active": "🟢 Наблюдаю", "paused": "⏸ На паузе"}.get(story.status, "Черновик")
     intensive = getattr(story, "monitoring_mode", "daily") == "intensive"
     schedule = (INTENSIVE_HELP + f"\nРежим до: {_date(story.intensive_until)}"
-                if intensive else f"Проверка каждые {int(story.check_frequency_hours)} ч.\n"
-                "Количество срочных наблюдений зависит от тарифа: /account.")
+                if intensive else "🗓 В ежедневном отчёте. Время по Москве: /report.\n"
+                f"Проверка каждые {int(story.check_frequency_hours)} ч.")
     if story.status == "paused":
         schedule += "\nПроверки приостановлены."
         if intensive:
@@ -193,10 +233,11 @@ def story_keyboard(story: Any) -> InlineKeyboardMarkup:
     else:
         rows.append([_button("▶️ Возобновить", "resume", story.id)])
     if getattr(story, "monitoring_mode", "daily") == "intensive":
-        rows.append([_button("🕒 Вернуть обычный режим", "daily", story.id)])
+        rows.append([_button("🗓 В ежедневный отчёт", "daily", story.id)])
     elif story.status == "active":
         rows.append([_button("⚡ Следить внимательнее", "focus", story.id)])
     rows.extend([
+        [InlineKeyboardButton(text="🕒 Время отчёта", callback_data="report:settings")],
         [_button("⭐ Интересна тема", "interest", story.id)],
         [_button("🕒 История", "history", story.id), _button("💬 Обсудить", "chat", story.id)],
         [_button("🗑 Удалить", "delete", story.id), _button("📋 Все наблюдения", "list", 0)],
@@ -596,7 +637,8 @@ def build_router(service: Any, settings: Any) -> Router:
         await _answer(message,
             "📰 <b>Следите за развитием истории</b>\n\n"
             "Пришлите ссылку, перешлите пост из канала или напишите, за чем следить. Посты с фото/видео принимаю по тексту подписи. Я покажу, что понял, и попрошу подтвердить наблюдение.\n\n"
-            f"Проверяю каждые {int(settings.default_check_interval_hours)} ч. Уведомляю, когда появляются существенные новые сведения. Пересказы стараюсь пропускать.\n\n"
+            "Обычные подписки собираю в ежедневный отчёт в выбранное время по Москве. "
+            "Без изменений — прочерк. В срочном режиме важные изменения присылаю после каждой проверки.\n\n"
             + INTENSIVE_HELP + "\n\n"
             "Например: «Когда откроют новую станцию метро и изменились ли сроки?»\n\n"
             "Можно выбрать «⭐ Просто интересна тема» — запомню интерес для будущих подборок без запуска наблюдения.\n\n"
@@ -609,8 +651,8 @@ def build_router(service: Any, settings: Any) -> Router:
         await _answer(message,
             "<b>Как пользоваться</b>\n\n"
             "1. Пришлите ссылку, текст новости или перешлите пост из канала — с текстом либо подписью к фото/видео. Альбом принимаю как одну новость.\n"
-            "2. Проверьте карточку и нажмите «Следить» либо «⭐ Просто интересна тема», чтобы только сохранить интерес.\n"
-            "3. Получайте уведомления о развитии истории и отмечайте, были ли они полезны.\n\n"
+            "2. Нажмите «В ежедневный отчёт» и выберите время или включите «Следить внимательнее».\n"
+            "3. Получайте отчёты. «Читать дальше» открывает полный текст обновления.\n\n"
             f"Автоматическая проверка — каждые {int(settings.default_check_interval_hours)} ч. "
             f"До {int(settings.max_stories_per_user)} наблюдений на человека. "
             f"Ручных проверок — до {int(settings.max_manual_checks_per_day)} в сутки; "
@@ -618,7 +660,7 @@ def build_router(service: Any, settings: Any) -> Router:
             + INTENSIVE_HELP + "\n"
             "Время считается от включения режима, а не от предыдущей проверки. На паузе срок продолжает идти, "
             "и тема занимает место до выключения, переноса или окончания режима. "
-            "Ручная проверка не откладывает автоматическую. Уведомления приходят только при новых важных фактах.\n\n"
+            "Ручная проверка не откладывает автоматическую. /report — время ежедневного отчёта по Москве.\n\n"
             "/watching — список, история, пауза и удаление\n"
             "/journal — все отправленные уведомления с выбором периода\n"
             "/news — все присланные новости, отложенные карточки и повтор обработки\n"
@@ -682,8 +724,55 @@ def build_router(service: Any, settings: Any) -> Router:
         result = await service.demo_update(message.from_user.id, _command_id(command))
         await _answer(message, escaped(result, 1800))
 
+    async def offer_report_time(message, user_id):
+        if await service.repo.claim_report_prompt(user_id) is not None:
+            try:
+                await _answer(message, REPORT_PROMPT, report_keyboard())
+            except Exception:
+                await service.repo.reset_report_prompt(user_id)
+                raise
+
+    @router.message(Command('report'), ~F.forward_origin)
+    async def report_command(message: Message, command: CommandObject):
+        if command.args:
+            await service.repo.set_report_time(message.from_user.id, command.args.strip())
+            await _answer(message, f'✅ Ежедневный отчёт — в {escaped(command.args.strip(), 10)} МСК. '
+                          'Изменить время: /report.', report_keyboard())
+        else:
+            pref = await service.repo.report_preference(message.from_user.id)
+            current = (f'Сейчас: {pref.minute // 60:02d}:{pref.minute % 60:02d} МСК.\n\n'
+                       if pref and pref.minute is not None else '')
+            await _answer(message, current + REPORT_PROMPT, report_keyboard())
+
     @router.callback_query()
     async def callback(query: CallbackQuery) -> None:
+        if (query.data or '').startswith('report:'):
+            await query.answer()
+            value = query.data.split(':', 1)[1]
+            if value == 'settings':
+                pref = await service.repo.report_preference(query.from_user.id)
+                current = (f'Сейчас: {pref.minute // 60:02d}:{pref.minute % 60:02d} МСК.\n\n'
+                           if pref and pref.minute is not None else '')
+                await _answer(query.message, current + REPORT_PROMPT, report_keyboard())
+            else:
+                await service.repo.set_report_time(query.from_user.id, value)
+                await _replace(query.message, f'✅ Ежедневный отчёт — в {escaped(value, 10)} МСК. '
+                               'Все обычные подписки собраны вместе. Изменить время: /report.')
+            return
+        full_match = re.fullmatch(r'full:([1-9][0-9]{0,9})', query.data or '')
+        if full_match:
+            await query.answer()
+            pair = await service.repo.get_full_update(query.from_user.id, int(full_match[1]))
+            if pair is None:
+                await _answer(query.message, 'Обновление удалено или недоступно.')
+                return
+            update, story = pair
+            pages = full_update_pages(story, update)
+            for index, page in enumerate(pages, 1):
+                prefix = f'📄 {index}/{len(pages)}\n\n' if len(pages) > 1 else ''
+                await _answer(query.message, prefix + page,
+                              _keyboard([_button('📰 К новости', 'story', story.id)]))
+            return
         if query.data in {'account:home', 'account:prices', 'account:history', 'account:manage'}:
             await query.answer()
             view = query.data.split(':')[1]
@@ -834,6 +923,7 @@ def build_router(service: Any, settings: Any) -> Router:
             await query.answer()
             story = await service.confirm_story(user_id, object_id)
             await _replace(message, "✅ Наблюдение создано.\n\n" + story_text(story), story_keyboard(story))
+            await offer_report_time(message, user_id)
             return
         if action == "cancel":
             await query.answer()
@@ -854,7 +944,8 @@ def build_router(service: Any, settings: Any) -> Router:
             await _answer(message, story_text(story), story_keyboard(story))
         elif action == "daily":
             changed = await service.set_monitoring_mode(user_id, object_id, "daily")
-            await _replace(message, "✅ В этой теме обычный режим.\n\n" + story_text(changed), story_keyboard(changed))
+            await _replace(message, "✅ Новость включена в ежедневный отчёт.\n\n" + story_text(changed), story_keyboard(changed))
+            await offer_report_time(message, user_id)
         elif action == "check":
             await run_manual_check(message, user_id, object_id)
         elif action in {"pause", "resume"}:
@@ -862,6 +953,8 @@ def build_router(service: Any, settings: Any) -> Router:
             if changed is None:
                 raise UserError("Наблюдение больше недоступно. Откройте /watching.")
             await _answer(message, story_text(changed), story_keyboard(changed))
+            if action == 'resume' and getattr(changed, 'monitoring_mode', 'daily') == 'daily':
+                await offer_report_time(message, user_id)
         elif action == "delete":
             await _answer(message,
                 f"Удалить наблюдение «{escaped(story.title, 200)}»?\n\nЕго тексты, источники и история будут удалены. Это действие нельзя отменить. "

@@ -31,7 +31,7 @@ def keyboard(item, story=None):
         if story and story.status in {'active', 'paused'}:
             rows.append([InlineKeyboardButton(text='📋 Открыть наблюдение', callback_data=f'story:{story.id}')])
         else:
-            rows.extend([[button('✅ Следить', 'watch')], [button('⚡ Следить внимательнее', 'focus')]])
+            rows.extend([[button('🗓 В ежедневный отчёт', 'watch')], [button('⚡ Следить внимательнее', 'focus')]])
         rows.append([button('⭐ Просто интересна тема', 'interest')])
         rows.append([button('📥 Решить позже', 'later')])
     elif item.status != 'processing' or not item.processing_until or item.processing_until <= datetime.now(timezone.utc):

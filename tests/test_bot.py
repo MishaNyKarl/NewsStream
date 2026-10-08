@@ -86,6 +86,9 @@ class Harness:
             recent_updates=AsyncMock(return_value=[change()]), give_feedback=AsyncMock(return_value=True),
             admin_summary=AsyncMock(return_value="Пользователей: 2\nНаблюдений: 4"),
             admin_errors=AsyncMock(return_value="Ошибок нет."), demo_update=AsyncMock(return_value="Тест подготовлен."),
+            repo=SimpleNamespace(claim_report_prompt=AsyncMock(return_value=None),
+                report_preference=AsyncMock(return_value=None), set_report_time=AsyncMock(),
+                get_full_update=AsyncMock(return_value=(change(), story()))),
         )
         self.settings = SimpleNamespace(default_check_interval_hours=24, max_stories_per_user=10,
                                         max_manual_checks_per_day=5, manual_check_cooldown_seconds=120,
@@ -169,7 +172,7 @@ def test_demo_is_explicit_and_sources_not_truncated():
     assert "не реальная новость" in text
     assert "href=" not in text
     keyboard = notification_keyboard(story(), update)
-    assert keyboard.inline_keyboard[0][0].url == update.source_urls[0]
+    assert any(button.url == update.source_urls[0] for row in keyboard.inline_keyboard for button in row)
     assert any(button.callback_data == "chat:11" for row in keyboard.inline_keyboard for button in row)
 
 

@@ -19,6 +19,7 @@ def main_keyboard():
         [InlineKeyboardButton(text='📋 Мои наблюдения', callback_data='list:0'),
          InlineKeyboardButton(text='⭐ Мои интересы', callback_data='interests:0')],
         [InlineKeyboardButton(text='💎 Подписка и кредиты', callback_data='account:home')],
+        [InlineKeyboardButton(text='🕒 Время ежедневного отчёта', callback_data='report:settings')],
         [InlineKeyboardButton(text='❔ Как пользоваться', callback_data='help:0')]])
 
 

@@ -319,3 +319,18 @@ class CommerceAudit(Base):
     action: Mapped[str] = mapped_column(String(32))
     detail: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class DailyReport(Base):
+    __tablename__ = 'daily_reports'
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.telegram_id', ondelete='CASCADE'), primary_key=True)
+    minute: Mapped[int | None] = mapped_column(Integer)
+    next_at: Mapped[datetime | None] = mapped_column(UTCDateTime, index=True)
+    since: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    prompt_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    token: Mapped[str | None] = mapped_column(String(64))
+    locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    retry_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    payload: Mapped[list | None] = mapped_column(JSON)
+    cutoff: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    sent_parts: Mapped[int] = mapped_column(Integer, default=0)

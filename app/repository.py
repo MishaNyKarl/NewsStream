@@ -22,6 +22,7 @@ from sqlalchemy import delete, func, or_, select, text, update
 from app.domain import Analysis, Candidate, InterestSaveResult, StoryExtraction, UserError
 from app.models import Feedback, Source, Story, StoryUpdate, UsageEvent, User, UserInterest, UserNews, utcnow
 from app.news_repository import NewsRepository
+from app.daily_reports import DailyReportRepository
 from app.monitoring import INTENSIVE_DURATION, IntensiveSlotOccupied, completion_next, next_checkpoint
 from app.product_analytics import BUSINESS_EVENTS, ProductAnalyticsRepository, add_event
 
@@ -36,7 +37,7 @@ def _day_start():
     return utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-class Repository(NewsRepository, ProductAnalyticsRepository):
+class Repository(NewsRepository, ProductAnalyticsRepository, DailyReportRepository):
     def __init__(self, settings, session_factory=None):
         if session_factory is None:
             from app.db import Session
@@ -532,7 +533,9 @@ class Repository(NewsRepository, ProductAnalyticsRepository):
         async with self._transaction() as session:
             now = utcnow()
             rows = (await session.execute(select(StoryUpdate, Story).join(Story, Story.id == StoryUpdate.story_id)
-                .where(Story.status == "active", StoryUpdate.notified_at.is_(None), StoryUpdate.delivery_attempts < 5,
+                .where(Story.status == "active", or_(StoryUpdate.is_demo.is_(True),
+                    (Story.monitoring_mode == "intensive") & (StoryUpdate.created_at >= Story.intensive_started_at)),
+                    StoryUpdate.notified_at.is_(None), StoryUpdate.delivery_attempts < 5,
                     or_(StoryUpdate.delivery_locked_until.is_(None), StoryUpdate.delivery_locked_until <= now))
                 .order_by(StoryUpdate.created_at, StoryUpdate.id).limit(max(0, limit))
                 .with_for_update(skip_locked=True, of=StoryUpdate, key_share=True))).all()
