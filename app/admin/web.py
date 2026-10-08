@@ -20,6 +20,7 @@ from starlette.responses import HTMLResponse, PlainTextResponse, RedirectRespons
 from starlette.responses import Response
 from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.admin.calculator import FIELDS, calculate, validate
 from app.admin.config import Config
@@ -32,12 +33,14 @@ from app.commerce import Commerce
 from app.errors import UserError
 from app.models import Plan, UserProfile
 from app.admin.people import directory, event_name
+from app.announcements import Announcements, AUDIENCES, BUTTONS, STATUSES, TEMPLATES, announcement_text
 
 COOKIE = '__Host-newswatch-admin'
 ROOT = Path(__file__).parent
 TITLES = {'/': 'Обзор', '/users': 'Пользователи', '/stories': 'Наблюдения', '/costs': 'Расходы LLM',
           '/analytics': 'Аналитика продукта',
           '/commerce': 'Тарифы и кредиты',
+          '/announcements': 'Оповещения',
           '/access': 'Доступ к панели',
           '/checks': 'Проверки', '/errors': 'Ошибки', '/notifications': 'Уведомления',
           '/calculator': 'Калькулятор', '/project': 'Проект и сервер', '/docs': 'Документация', '/audit': 'Журнал действий'}
@@ -117,6 +120,7 @@ def create_app(config=None, data=None, ops=None):
     commerce_data = Data(config.database_url, commerce_write=True)
     commerce = Commerce(commerce_data.sessions, SimpleNamespace(
         max_stories_per_user=10, max_manual_checks_per_day=5, llm_daily_call_limit=250))
+    announcements = Announcements(commerce_data.sessions)
     ops = ops or Ops(config.ops_socket)
     login_lock = asyncio.Lock()  # At most one 64 MiB Argon2 operation in flight.
     templates = Environment(loader=FileSystemLoader(ROOT/'templates'), autoescape=select_autoescape())
@@ -151,7 +155,7 @@ def create_app(config=None, data=None, ops=None):
         raw = bytearray()
         async for chunk in request.stream():
             raw.extend(chunk)
-            if len(raw) > 8192:
+            if len(raw) > (65536 if request.url.path == '/announcements' else 8192):
                 raise HTTPException(413, 'Слишком большая форма')
         try:
             parsed = parse_qs(raw.decode('utf-8'), keep_blank_values=True, max_num_fields=30, errors='strict')
@@ -390,6 +394,72 @@ def create_app(config=None, data=None, ops=None):
         except ValueError:
             return render(request, 'message.html', status=400, message='Некорректное число. Вернитесь и проверьте поля.')
 
+    async def announcements_page(request):
+        try:
+            if request.method == 'POST':
+                values = await form(request)
+                action = values.get('action')
+                if action == 'create':
+                    campaign = await announcements.create(values, actor(request), values.get('key', ''))
+                    state.audit(actor(request), 'announcement_draft', str(campaign.id))
+                else:
+                    cid = int(values.get('campaign', '0'))
+                    if not 0 < cid < 2**31:
+                        raise ValueError
+                    detail = await announcements.detail(cid)
+                    if action == 'test':
+                        if not re.fullmatch(r'[1-9][0-9]{0,18}', values.get('test_user', '')):
+                            raise UserError('Для теста укажите один Telegram ID из раздела «Пользователи».')
+                        original = detail['campaign']
+                        campaign = await announcements.create(dict(title='🧪 Тест: ' + original.title[:145],
+                            body=original.body, audience='selected', ids=values.get('test_user', ''),
+                            button=original.button), actor(request), values.get('key', ''))
+                        # Test delivery uses the same durable worker queue as the real campaign.
+                        await announcements.action(campaign.id, 'launch')
+                        state.audit(actor(request), 'announcement_test', str(cid))
+                    else:
+                        if action == 'launch' and detail['campaign'].status == 'draft':
+                            if not state.consume(values.get('nonce', ''), request.state.admin_session['id'],
+                                f'announcement:{cid}', actor(request), audit_action='announcement_requested'):
+                                raise UserError('Предпросмотр устарел. Откройте оповещение и проверьте текст ещё раз.')
+                        campaign = await announcements.action(cid, action)
+                        state.audit(actor(request), 'announcement_' + action, str(cid))
+                return RedirectResponse(f'/announcements?id={campaign.id}', 303)
+            selected = None
+            if request.query_params.get('id'):
+                cid = int(request.query_params['id'])
+                if not 0 < cid < 2**31:
+                    raise ValueError
+                selected = await announcements.detail(cid)
+            preset = dict(TEMPLATES.get(request.query_params.get('template', 'update'), TEMPLATES['update']))
+            if request.query_params.get('copy'):
+                cid = int(request.query_params['copy'])
+                if not 0 < cid < 2**31:
+                    raise ValueError
+                original = (await announcements.detail(cid))['campaign']
+                preset = dict(title=original.title, body=original.body, audience=original.audience, button=original.button)
+                if original.audience == 'selected':
+                    async with data.sessions() as session:
+                        from sqlalchemy import select
+                        from app.models import AnnouncementDelivery
+                        ids = (await session.scalars(select(AnnouncementDelivery.user_id).where(
+                            AnnouncementDelivery.announcement_id == cid).order_by(AnnouncementDelivery.user_id))).all()
+                        preset['ids'] = ', '.join(map(str, ids))
+            nonce = (state.nonce(request.state.admin_session['id'], f'announcement:{selected["campaign"].id}')
+                     if selected and selected['campaign'].status == 'draft'
+                     and request.state.admin_session.get('role', 'owner') in {'owner', 'admin'} else '')
+            return render(request, 'announcements.html', result=await announcements.dashboard(), selected=selected,
+                          preset=preset, audiences=AUDIENCES, buttons=BUTTONS, statuses=STATUSES,
+                          preview=announcement_text(selected['campaign']) if selected else '',
+                          nonce=nonce, key=lambda: str(uuid4()))
+        except UserError as exc:
+            return render(request, 'message.html', status=400, message=str(exc))
+        except ValueError:
+            return render(request, 'message.html', status=400, message='Некорректный номер оповещения.')
+        except SQLAlchemyError:
+            return render(request, 'message.html', status=503,
+                          message='Оповещения временно недоступны. Проверьте подключение к базе и миграции.')
+
     async def access_page(request):
         if request.method == 'POST':
             values = await form(request)
@@ -419,6 +489,7 @@ def create_app(config=None, data=None, ops=None):
               Route('/project', project), Route('/restart/prepare', restart_prepare, methods=['POST']),
               Route('/analytics', analytics), Route('/analytics.csv', analytics),
               Route('/commerce', commerce_page, methods=['GET', 'POST']),
+              Route('/announcements', announcements_page, methods=['GET', 'POST']),
               Route('/users/{uid:int}/avatar', avatar),
               Route('/access', access_page, methods=['GET', 'POST']),
               Route('/restart', restart, methods=['POST']), Route('/docs', docs), Route('/audit', audit),

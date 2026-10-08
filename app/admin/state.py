@@ -157,13 +157,13 @@ class State:
                        (value, session, target, time.time()+180))
         return value
 
-    def consume(self, nonce, session, target, actor):
+    def consume(self, nonce, session, target, actor, audit_action='restart_requested'):
         with self.db() as db:
             updated = db.execute('UPDATE nonces SET consumed=1 WHERE id=? AND session=? AND target=? '
                                  'AND expires>=? AND consumed=0', (nonce, session, target, time.time()))
             if updated.rowcount != 1:
                 return False
-            self._audit(db, actor, 'restart_requested', target, nonce)
+            self._audit(db, actor, audit_action, target, nonce)
             return True
 
     def calculator(self):

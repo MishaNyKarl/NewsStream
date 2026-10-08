@@ -6,7 +6,7 @@ RUN pip install -r requirements-admin.txt \
     && groupadd --gid 10001 adminui \
     && useradd --uid 10001 --gid 10001 --no-create-home adminui \
     && mkdir /data && chown 10001:10001 /data
-COPY app/__init__.py app/models.py app/commerce.py app/errors.py ./app/
+COPY app/__init__.py app/models.py app/commerce.py app/errors.py app/announcements.py ./app/
 COPY app/admin ./app/admin
 COPY docs ./docs
 USER 10001:10001

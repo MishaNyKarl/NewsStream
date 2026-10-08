@@ -334,3 +334,37 @@ class DailyReport(Base):
     payload: Mapped[list | None] = mapped_column(JSON)
     cutoff: Mapped[datetime | None] = mapped_column(UTCDateTime)
     sent_parts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class Announcement(Base):
+    __tablename__ = 'announcements'
+    __table_args__ = (CheckConstraint("status IN ('draft','queued','completed','cancelled')", name='ck_announcement_status'),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(100), unique=True)
+    title: Mapped[str] = mapped_column(String(160))
+    body: Mapped[str] = mapped_column(Text)
+    audience: Mapped[str] = mapped_column(String(32))
+    button: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(16), default='draft')
+    created_by: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    launched_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+class AnnouncementDelivery(Base):
+    __tablename__ = 'announcement_deliveries'
+    __table_args__ = (UniqueConstraint('announcement_id', 'user_id', name='uq_announcement_recipient'),
+        CheckConstraint("status IN ('pending','sending','sent','blocked','failed','cancelled')", name='ck_announcement_delivery_status'),
+        Index('ix_announcement_delivery_due', 'status', 'retry_at', 'locked_until'))
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    announcement_id: Mapped[int] = mapped_column(ForeignKey('announcements.id', ondelete='CASCADE'))
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.telegram_id', ondelete='CASCADE'))
+    status: Mapped[str] = mapped_column(String(16), default='pending')
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    retry_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    token: Mapped[str | None] = mapped_column(String(64))
+    sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    message_id: Mapped[int | None] = mapped_column(BigInteger)
+    error: Mapped[str | None] = mapped_column(String(64))

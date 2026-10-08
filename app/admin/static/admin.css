@@ -4,3 +4,5 @@ select{display:block;border:1px solid #a9bac4;border-radius:7px;padding:11px 12p
 .person{display:flex;gap:12px;align-items:center;min-width:200px}.avatar{width:48px;height:48px;flex:0 0 48px;display:flex;align-items:center;justify-content:center;background:#dbeee9;color:#075e50;border-radius:50%;font-size:23px;font-weight:650;overflow:hidden}.avatar img{object-fit:cover;width:48px;height:48px}
 
 .people-table td{min-width:110px}.people-table td:nth-child(7){white-space:nowrap}
+
+textarea{display:block;width:100%;border:1px solid #a9bac4;border-radius:7px;padding:12px;color:#172b36;font:inherit;resize:vertical;margin-top:6px}textarea:focus-visible{outline:3px solid #dda721;outline-offset:3px}.announcement-preview{max-width:580px;white-space:pre-wrap;overflow-wrap:anywhere;background:#edf7f2;border:1px solid #c7e2d6;border-radius:14px;padding:20px;margin:18px 0}.announcement-button{max-width:580px;background:#dbeee9;text-align:center;border-radius:8px;padding:12px;color:#075e50;font-weight:600}#compose,#preview{scroll-margin-top:20px}

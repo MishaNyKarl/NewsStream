@@ -4,13 +4,14 @@ import time
 import tempfile
 from pathlib import Path
 
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, ReplyParameters
 from app.bot import escaped, notification_text, notification_keyboard
 from app.user_news import ready_text, keyboard as news_keyboard
 from app.daily_reports import REPORT_PROMPT, report_keyboard
 from app.journal import MSK
 from app.navigation import with_home
+from app.announcements import Announcements, announcement_text
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +131,42 @@ async def deliver_report_prompt(service, bot):
         await service.repo.reset_report_prompt(owner)
         raise
 
+
+async def deliver_announcements(service, bot, limit=10):
+    queue = Announcements(service.repo.session_factory)
+    deadline = time.monotonic() + 20
+    for _ in range(limit):
+        if time.monotonic() >= deadline:
+            return
+        pair = await queue.claim()
+        if pair is None:
+            return
+        delivery, campaign = pair
+        if not await queue.may_send(delivery.id, delivery.token):
+            await queue.finish(delivery.id, delivery.token, 'cancelled')
+            continue
+        keyboard = None
+        if campaign.button == 'report':
+            keyboard = with_home([[InlineKeyboardButton(text='🕒 Выбрать время отчёта', callback_data='report:settings')]])
+        elif campaign.button == 'menu':
+            keyboard = with_home()
+        try:
+            message = await bot.send_message(delivery.user_id, announcement_text(campaign), parse_mode=None,
+                reply_markup=keyboard, disable_web_page_preview=True, request_timeout=30)
+            await queue.finish(delivery.id, delivery.token, 'sent', message_id=message.message_id)
+        except TelegramForbiddenError:
+            await queue.finish(delivery.id, delivery.token, 'blocked', error='bot_blocked')
+        except TelegramRetryAfter as exc:
+            await queue.finish(delivery.id, delivery.token, 'retry', error='rate_limit', retry_after=exc.retry_after)
+            # Respect Telegram's backoff for the entire announcement queue.
+            return
+        except TelegramBadRequest:
+            await queue.finish(delivery.id, delivery.token, 'permanent', error='telegram_rejected')
+        except Exception as exc:
+            await queue.finish(delivery.id, delivery.token, 'retry', error=type(exc).__name__[:64])
+            await service._error('announcement_delivery', exc, user_id=delivery.user_id)
+        await asyncio.sleep(0.1)
+
 async def run_worker(service, bot):
     heartbeat = Path(tempfile.gettempdir()) / 'newswatch-worker-heartbeat'
     check_tasks: set[asyncio.Task] = set()
@@ -137,6 +174,7 @@ async def run_worker(service, bot):
         while True:
             heartbeat.write_text(str(time.time()))
             try:
+                await deliver_announcements(service, bot)
                 await deliver_notifications(service, bot)
                 await deliver_news_ready(service, bot)
                 await deliver_report_prompt(service, bot)

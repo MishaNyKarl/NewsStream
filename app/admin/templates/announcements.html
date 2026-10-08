@@ -1,0 +1,42 @@
+{% extends 'base.html' %}{% block content %}
+{% macro hidden(action, cid=None) %}<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="action" value="{{ action }}">{% if cid %}<input type="hidden" name="campaign" value="{{ cid }}">{% endif %}{% endmacro %}
+<p>Сообщайте пользователям об изменениях бота, новом расписании и технических работах. Рассылка отправляется через бота по очереди. Откройте страницу заново, чтобы обновить результаты.</p>
+<section class="metrics">
+<article><span>Пользователей</span><strong>{{ result.coverage.all }}</strong></article>
+<article><span>С обычными подписками</span><strong>{{ result.coverage.daily }}</strong><small>Включая темы на паузе</small></article>
+<article><span>Ещё не выбрали время</span><strong>{{ result.coverage.no_time }}</strong><small>Напоминание можно отправить этой аудитории</small></article>
+</section>
+{% if selected %}{% set c=selected.campaign %}
+<section class="panel" id="preview"><h2>Оповещение #{{ c.id }} · {{ statuses[c.status] }}</h2>
+<p>{{ audiences[c.audience] }} · Получателей: <b>{{ selected.total }}</b> · Подготовил: {{ c.created_by }} · {{ c.created_at|display }}</p>
+<div class="announcement-preview">{{ preview }}</div>
+{% if c.button!='none' %}<div class="announcement-button">{{ buttons[c.button] }}</div>{% endif %}
+<p class="muted">Точный текст для Telegram. Формат — обычный текст. Получатели зафиксированы при подготовке; новые пользователи в эту рассылку не добавляются.</p>
+<p>Доставлено: <b>{{ selected.counts.get('sent',0) }}</b> · В очереди: {{ selected.counts.get('pending',0) }} · Отправляется: {{ selected.counts.get('sending',0) }} · Ошибки: {{ selected.counts.get('failed',0) }} · Бот недоступен: {{ selected.counts.get('blocked',0) }} · Отменено: {{ selected.counts.get('cancelled',0) }}</p>
+{% if web_role in ['owner','admin'] %}
+<div class="actions">
+{% if c.status=='draft' %}<form method="post">{{ hidden('launch',c.id) }}<input type="hidden" name="nonce" value="{{ nonce }}"><button>Отправить {{ selected.total }} пользователям</button></form>{% endif %}
+{% if c.status in ['draft','queued'] %}<form method="post">{{ hidden('cancel',c.id) }}<button class="danger">Остановить рассылку</button></form>{% endif %}
+{% if c.status in ['queued','completed'] and selected.counts.get('failed',0) %}<form method="post">{{ hidden('retry',c.id) }}<button class="quiet">Повторить только ошибки</button></form>{% endif %}
+<a href="/announcements?copy={{ c.id }}#compose">Создать копию и отредактировать</a>
+<a href="/announcements?id={{ c.id }}#preview">Обновить результаты</a></div>
+{% if c.status in ['draft','queued'] %}<p class="muted">Остановка отменит ожидающие отправки. Уже начатая отправка может завершиться.</p>{% endif %}
+<details><summary>Отправить тест одному пользователю</summary><form method="post" class="panel">{{ hidden('test',c.id) }}<input type="hidden" name="key" value="{{ key() }}"><label>Telegram ID получателя<input name="test_user" inputmode="numeric" pattern="[0-9]+" required placeholder="ID из раздела «Пользователи»"></label><p>Сообщение будет помечено «Тест». Основная рассылка не запускается.</p><button class="quiet">Отправить тест</button></form></details>
+{% endif %}
+<details><summary>Получатели и доставка (первые 100)</summary><div class="table-wrap"><table><tr><th>Пользователь</th><th>Время отчёта, МСК</th><th>Результат</th><th>Попытки</th><th>Доставлено</th></tr>
+{% for delivery,user,minute in selected.recipients %}<tr><td><a href="/users?user={{ user.telegram_id }}">{{ user.first_name or user.username or user.telegram_id }}</a><br><small>ID {{ user.telegram_id }}</small></td><td>{{ '%02d:%02d'|format(minute//60,minute%60) if minute is not none else 'Не выбрано' }}</td><td>{{ statuses[delivery.status] }}{% if delivery.error %}<br><small>{{ delivery.error }}</small>{% endif %}</td><td>{{ delivery.attempts }}</td><td>{{ delivery.sent_at|display }}</td></tr>{% endfor %}
+</table></div></details></section>
+{% endif %}
+{% if web_role in ['owner','admin'] %}
+<section class="panel" id="compose"><h2>Подготовить оповещение</h2>
+<p><a href="/announcements?template=update#compose">Обновление бота</a> · <a href="/announcements?template=reminder#compose">Напомнить о времени отчёта</a> · <a href="/announcements?template=maintenance#compose">Технические работы</a></p>
+<form method="post">{{ hidden('create') }}<input type="hidden" name="key" value="{{ key() }}">
+<label>Название<input name="title" maxlength="160" value="{{ preset.title }}" required></label>
+<label>Сообщение<textarea name="body" rows="12" maxlength="2500" required>{{ preset.body }}</textarea></label>
+<div class="form-grid"><label>Кому отправить<select name="audience">{% for value,label in audiences.items() %}<option value="{{ value }}" {% if preset.audience==value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+<label>Кнопка под сообщением<select name="button">{% for value,label in buttons.items() %}<option value="{{ value }}" {% if preset.button==value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label></div>
+<label>Telegram ID для аудитории «Выбранные пользователи»<input name="ids" value="{{ preset.ids or '' }}" placeholder="Несколько ID через запятую; для остальных аудиторий поле не нужно"></label>
+<button>Предпросмотр и получатели</button><p class="muted">Этот шаг сохраняет черновик. Отправка начинается отдельной кнопкой после проверки сообщения.</p></form></section>
+{% endif %}
+<h2>История оповещений</h2><div class="table-wrap"><table><tr><th>Оповещение</th><th>Аудитория</th><th>Статус</th><th>Доставлено / всего</th><th>Создано</th></tr>{% for item in result.campaigns %}<tr><td><a href="/announcements?id={{ item.campaign.id }}#preview">#{{ item.campaign.id }} {{ item.campaign.title }}</a></td><td>{{ audiences[item.campaign.audience] }}</td><td>{{ statuses[item.campaign.status] }}</td><td>{{ item.counts.get('sent',0) }} / {{ item.total }}</td><td>{{ item.campaign.created_at|display }}</td></tr>{% else %}<tr><td colspan="5">Оповещений ещё нет. Начните с готового шаблона выше.</td></tr>{% endfor %}</table></div>
+{% endblock %}
