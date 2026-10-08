@@ -10,6 +10,7 @@ allows foreign-key KEY SHARE locks when another transaction records usage. An
 exclusive FOR UPDATE lock would deadlock user/story or story/outbox mutations
 against those usage inserts despite the application not changing any key.
 """
+from app.economy import permitted
 import asyncio
 import hashlib
 import unicodedata
@@ -411,7 +412,7 @@ class Repository(NewsRepository, ProductAnalyticsRepository, DailyReportReposito
             await self._expire_intensive(session)
             now = utcnow()
             return list((await session.scalars(select(Story.id).where(
-                Story.status == "active", Story.next_check_at <= now,
+                permitted(Story.user_id, self.settings.admin_ids), Story.status == "active", Story.next_check_at <= now,
                 or_(Story.lock_until.is_(None), Story.lock_until <= now))
                 .order_by(Story.next_check_at, Story.id).limit(max(0, limit)))).all())
 
@@ -550,7 +551,7 @@ class Repository(NewsRepository, ProductAnalyticsRepository, DailyReportReposito
         async with self._transaction() as session:
             now = utcnow()
             rows = (await session.execute(select(StoryUpdate, Story).join(Story, Story.id == StoryUpdate.story_id)
-                .where(Story.status == "active", or_(StoryUpdate.is_demo.is_(True),
+                .where(permitted(Story.user_id, self.settings.admin_ids), Story.status == "active", or_(StoryUpdate.is_demo.is_(True),
                     (Story.monitoring_mode == "intensive") & (StoryUpdate.created_at >= Story.intensive_started_at)),
                     StoryUpdate.notified_at.is_(None), StoryUpdate.delivery_attempts < 5,
                     or_(StoryUpdate.delivery_locked_until.is_(None), StoryUpdate.delivery_locked_until <= now))

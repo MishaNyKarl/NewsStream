@@ -17,6 +17,11 @@ from app.report_controls import DEFAULTS, ReportControls, clip_words
 log = logging.getLogger(__name__)
 
 
+async def allowed(service, uid):
+    policy = getattr(service, 'economy_allowed', None)
+    return not policy or await policy(uid)
+
+
 async def display_options(service, uid):
     commerce = getattr(service, 'commerce', None)
     enabled = bool((await commerce.snapshot(uid))['limits'].get('full_reports', False)) if commerce else False
@@ -26,6 +31,8 @@ async def display_options(service, uid):
 
 async def deliver_news_ready(service, bot):
     for item in await service.repo.pending_news_notices():
+        if not await allowed(service, item.user_id):
+            continue
         success = False
         retry_after = 0
         try:
@@ -47,6 +54,8 @@ async def deliver_news_ready(service, bot):
 
 async def deliver_notifications(service, bot):
     for update, story in await service.repo.pending_notifications(limit=1):
+        if not await allowed(service, story.user_id):
+            continue
         success = False
         message_id = None
         try:
@@ -97,11 +106,13 @@ def daily_report_page(entries, cutoff, index, count, full_reports=False, word_li
 
 async def deliver_daily_reports(service, bot):
     pref = await service.repo.claim_daily_report()
-    if pref is None:
+    if pref is None or not await allowed(service, pref.user_id):
         return
     try:
         chunks = [pref.payload[i:i+3] for i in range(0, len(pref.payload), 3)]
         for index in range(pref.sent_parts, len(chunks)):
+            if not await allowed(service, pref.user_id):
+                return
             entries = []
             for entry in chunks[index]:
                 fresh = await service.repo.get_story(pref.user_id, entry['story_id'])
@@ -132,6 +143,9 @@ async def deliver_report_prompt(service, bot):
     owner = await service.repo.claim_report_prompt()
     if owner is None:
         return
+    if not await allowed(service, owner):
+        await service.repo.reset_report_prompt(owner)
+        return
     try:
         await bot.send_message(owner, REPORT_PROMPT, reply_markup=report_keyboard(), request_timeout=30)
     except TelegramForbiddenError:
@@ -149,10 +163,12 @@ async def deliver_announcements(service, bot, limit=10):
     for _ in range(limit):
         if time.monotonic() >= deadline:
             return
-        pair = await queue.claim()
+        pair = await queue.claim(admin_ids=getattr(getattr(service, 'settings', None), 'admin_ids', ()))
         if pair is None:
             return
         delivery, campaign = pair
+        if not await allowed(service, delivery.user_id):
+            return
         if not await queue.may_send(delivery.id, delivery.token):
             await queue.finish(delivery.id, delivery.token, 'cancelled')
             continue
@@ -188,10 +204,16 @@ async def deliver_announcements(service, bot, limit=10):
 async def run_worker(service, bot):
     heartbeat = Path(tempfile.gettempdir()) / 'newswatch-worker-heartbeat'
     check_tasks: set[asyncio.Task] = set()
+    owners = {}
     try:
         while True:
             heartbeat.write_text(str(time.time()))
             try:
+                if getattr(service, 'economy', None):
+                    for task in list(check_tasks):
+                        if not task.done() and not await service.economy_allowed(owners.get(task)):
+                            task.cancel()
+                    await asyncio.gather(*(t for t in check_tasks if t.cancelling()), return_exceptions=True)
                 await deliver_announcements(service, bot)
                 await deliver_notifications(service, bot)
                 await deliver_news_ready(service, bot)
@@ -203,6 +225,8 @@ async def run_worker(service, bot):
                         if story:
                             task = asyncio.create_task(service.check_story(story))
                             check_tasks.add(task)
+                            owners[task] = story.user_id
+                            task.add_done_callback(lambda done: owners.pop(done, None))
                             task.add_done_callback(check_tasks.discard)
             except Exception as exc:
                 await service._error('worker', exc)

@@ -380,3 +380,13 @@ class ReportControl(Base):
     version: Mapped[int] = mapped_column(Integer, default=0)
     updated_by: Mapped[str] = mapped_column(String(80))
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class EconomyState(Base):
+    __tablename__ = 'economy_state'
+    __table_args__ = (CheckConstraint('id = 1', name='ck_economy_singleton'),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    updated_by: Mapped[str] = mapped_column(String(80))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

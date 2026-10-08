@@ -3,6 +3,7 @@ import re
 from datetime import timedelta
 from uuid import uuid4
 
+from app.economy import permitted
 from sqlalchemy import func, or_, select, text
 
 from app.commerce import Commerce
@@ -175,7 +176,7 @@ class Announcements:
         if not remaining and campaign.status == 'queued':
             campaign.status, campaign.finished_at = 'completed', utcnow()
 
-    async def claim(self):
+    async def claim(self, admin_ids=()):
         async with self.transaction() as session:
             await self.lock(session)
             now = utcnow()
@@ -193,6 +194,7 @@ class Announcements:
                 AnnouncementDelivery.status == 'sending', AnnouncementDelivery.locked_until > now).limit(1)):
                 return None
             delivery = await session.scalar(select(AnnouncementDelivery).join(Announcement).where(
+                permitted(AnnouncementDelivery.user_id, admin_ids),
                 Announcement.status == 'queued', AnnouncementDelivery.status.in_(('pending', 'sending')),
                 or_(AnnouncementDelivery.locked_until.is_(None), AnnouncementDelivery.locked_until <= now),
                 or_(AnnouncementDelivery.retry_at.is_(None), AnnouncementDelivery.retry_at <= now)

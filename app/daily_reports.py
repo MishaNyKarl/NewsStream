@@ -6,6 +6,7 @@ from uuid import uuid4
 from aiogram.types import InlineKeyboardButton
 from sqlalchemy import or_, select
 
+from app.economy import permitted
 from app.domain import UserError
 from app.journal import MSK
 from app.models import DailyReport, Story, StoryUpdate, utcnow
@@ -59,7 +60,7 @@ class DailyReportRepository:
         """Also offers migrated users and expired intensive subscriptions a time choice."""
         async with self._transaction() as session:
             await self._advisory(session, QUEUE_LOCK)
-            query = select(Story.user_id).where(Story.status == 'active', Story.monitoring_mode == 'daily')
+            query = select(Story.user_id).where(permitted(Story.user_id, self.settings.admin_ids), Story.status == 'active', Story.monitoring_mode == 'daily')
             if user_id is not None:
                 query = query.where(Story.user_id == user_id)
             owners = (await session.scalars(query.distinct().order_by(Story.user_id))).all()
@@ -94,7 +95,7 @@ class DailyReportRepository:
             if await session.scalar(select(DailyReport.user_id).where(DailyReport.locked_until > now).limit(1)):
                 return None
             pref = await session.scalar(select(DailyReport).where(
-                DailyReport.next_at <= now,
+                permitted(DailyReport.user_id, self.settings.admin_ids), DailyReport.next_at <= now,
                 or_(DailyReport.retry_at.is_(None), DailyReport.retry_at <= now)
             ).order_by(DailyReport.next_at, DailyReport.user_id).limit(1).with_for_update(key_share=True))
             if pref is None:

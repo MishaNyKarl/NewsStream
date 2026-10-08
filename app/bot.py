@@ -338,6 +338,11 @@ class AccessMiddleware(BaseMiddleware):
             if admitted is None:
                 await self._tell(event, f"{DENIED}\nВаш Telegram ID: {user.id}", alert=True)
                 return None
+            from app.economy import NOTICE
+            policy = getattr(self.service, 'economy_allowed', None)
+            if policy and not await policy(user.id):
+                await self._tell(event, NOTICE, alert=True)
+                return None
             track = getattr(self.service, 'track_interaction', None)
             if track:
                 event_key = f'callback:{event.id}' if isinstance(event, CallbackQuery) else f'message:{event.message_id}'

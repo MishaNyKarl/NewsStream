@@ -34,6 +34,7 @@ from app.errors import UserError
 from app.models import Plan, UserProfile
 from app.admin.people import directory, event_name
 from app.announcements import Announcements, AUDIENCES, BUTTONS, STATUSES, TEMPLATES, announcement_text
+from app.economy import Economy
 from app.report_controls import ReportControls, FIELDS as REPORT_FIELDS, DEFAULTS as REPORT_DEFAULTS, clip_words
 
 COOKIE = '__Host-newswatch-admin'
@@ -66,8 +67,9 @@ def redact_doc(value):
 
 
 class Security:
-    def __init__(self, app, config, state):
+    def __init__(self, app, config, state, economy):
         self.app, self.config, self.state = app, config, state
+        self.economy = economy
 
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http':
@@ -110,6 +112,11 @@ class Security:
                 return await PlainTextResponse('Недопустимый источник запроса', 403)(scope, receive, secured_send)
             if request.headers.get('sec-fetch-site', 'same-origin') not in {'same-origin', 'none'}:
                 return await PlainTextResponse('Недопустимый источник запроса', 403)(scope, receive, secured_send)
+        if not public:
+            try:
+                scope['state']['economy'] = await self.economy.snapshot()
+            except SQLAlchemyError:
+                scope['state']['economy'] = {'enabled': True, 'version': None, 'unavailable': True}
         await self.app(scope, receive, secured_send)
 
 
@@ -124,6 +131,7 @@ def create_app(config=None, data=None, ops=None):
         max_stories_per_user=10, max_manual_checks_per_day=5, llm_daily_call_limit=250))
     announcements = Announcements(commerce_data.sessions)
     report_controls = ReportControls(commerce_data.sessions)
+    economy = Economy(commerce_data.sessions)
     ops = ops or Ops(config.ops_socket)
     login_lock = asyncio.Lock()  # At most one 64 MiB Argon2 operation in flight.
     templates = Environment(loader=FileSystemLoader(ROOT/'templates'), autoescape=select_autoescape())
@@ -143,6 +151,7 @@ def create_app(config=None, data=None, ops=None):
         session = request.state.admin_session
         role = (session or {}).get('role', 'owner')
         nav = {path: title for path, title in TITLES.items() if path != '/access' or role == 'owner'}
+        context.update(economy=getattr(request.state, 'economy', {'enabled': False, 'version': 0}))
         context.update(request=request, title=TITLES.get(request.url.path, 'NewsStream'), nav=nav, web_role=role,
                        csrf=session['csrf'] if session else '', authenticated=bool(session and session['authenticated']))
         return HTMLResponse(templates.get_template(template).render(**context), status_code=status)
@@ -494,6 +503,28 @@ def create_app(config=None, data=None, ops=None):
             return render(request, 'message.html', status=503,
                           message='Оповещения временно недоступны. Проверьте подключение к базе и миграции.')
 
+    async def economy_page(request):
+        values = await form(request)
+        if request.state.admin_session.get('role', 'owner') not in {'owner', 'admin'}:
+            raise HTTPException(403, 'Недостаточно прав')
+        enabled = values.get('enabled')
+        if enabled not in {'0', '1'}:
+            raise HTTPException(400, 'Некорректный режим')
+        target = f'economy:{enabled}:{values.get("version", "")}'
+        if request.url.path == '/economy/prepare':
+            if str(request.state.economy['version']) != values.get('version'):
+                raise HTTPException(409, 'Режим уже изменился. Обновите страницу.')
+            nonce = state.nonce(request.state.admin_session['id'], target)
+            return render(request, 'economy.html', desired=enabled, version=values['version'], nonce=nonce)
+        if not state.consume(values.get('nonce', ''), request.state.admin_session['id'], target,
+                             actor(request), audit_action='economy_confirmed'):
+            raise HTTPException(409, 'Подтверждение устарело. Повторите переключение.')
+        try:
+            await economy.save(enabled == '1', values.get('version'), actor(request), values['nonce'])
+        except UserError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return RedirectResponse('/', 303)
+
     async def access_page(request):
         if request.method == 'POST':
             values = await form(request)
@@ -518,7 +549,8 @@ def create_app(config=None, data=None, ops=None):
         await data.close()
         await commerce_data.close()
 
-    routes = [Route('/login', login, methods=['GET', 'POST']), Route('/logout', logout, methods=['POST']),
+    routes = [Route('/economy/prepare', economy_page, methods=['POST']),
+              Route('/economy', economy_page, methods=['POST']), Route('/login', login, methods=['GET', 'POST']), Route('/logout', logout, methods=['POST']),
               Route('/healthz', health), Route('/calculator', calculator, methods=['GET', 'POST']),
               Route('/project', project), Route('/restart/prepare', restart_prepare, methods=['POST']),
               Route('/analytics', analytics), Route('/analytics.csv', analytics),
@@ -532,4 +564,4 @@ def create_app(config=None, data=None, ops=None):
     routes += [Route(path, dashboard) for path in ('/', '/users', '/stories', '/costs', '/checks', '/errors', '/notifications')]
     app = Starlette(routes=routes, lifespan=lifespan, exception_handlers={HTTPException: error})
     app.state.admin = state
-    return Security(app, config, state)
+    return Security(app, config, state, economy)

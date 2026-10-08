@@ -1,0 +1,5 @@
+{% extends 'base.html' %}{% block content %}
+<section class="panel"><h2>{{ 'Включить' if desired == '1' else 'Выключить' }} режим экономии?</h2>
+<p>{% if desired == '1' %}Пользовательские действия, автоматические проверки и уведомления будут приостановлены для всех, кроме администраторов Telegram. Новые платные запросы этих пользователей прекратятся. Уже отправленный провайдеру запрос может завершиться и тарифицироваться.{% else %}Все пользователи снова смогут пользоваться ботом. Возобновятся проверки и очередь уведомлений, включая накопленные сообщения. Расходы на поиск и анализ возобновятся.{% endif %}</p>
+<p>Новости, подписки, время отчётов и балансы сохраняются.</p>
+<form method="post" action="/economy"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="enabled" value="{{ desired }}"><input type="hidden" name="version" value="{{ version }}"><input type="hidden" name="nonce" value="{{ nonce }}"><button>{{ 'Да, приостановить' if desired == '1' else 'Да, возобновить' }}</button> <a href="/">Отмена</a></form></section>{% endblock %}

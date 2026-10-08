@@ -21,6 +21,7 @@ from app.search.client import SearchClient
 from app.search.dedupe import content_hash, is_near_duplicate, normalize_url
 from app.search.planning import diverse_results, plan_queries, publisher, source_cutoff
 from app.progress import CheckMetrics, CheckOutcome, progress_context, report
+from app.economy import Economy, NOTICE
 from app.report_controls import DEFAULTS, ReportControls
 
 log = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class BotService:
         self.repo = repo or Repository(settings)
         self.commerce = Commerce(self.repo.session_factory, settings) if isinstance(self.repo, Repository) else None
         self.report_controls = ReportControls(self.repo.session_factory) if isinstance(self.repo, Repository) else None
+        self.economy = Economy(self.repo.session_factory) if isinstance(self.repo, Repository) else None
         self.ai = ai or AIClient(settings, self._usage)
         self.search = search or SearchClient(settings, self._usage)
         self.fetcher = fetcher or ContentFetcher()
@@ -46,6 +48,9 @@ class BotService:
 
     async def _usage(self, operation, provider='', **kwargs):
         context = usage_context.get()
+        if operation in {'llm_attempt', 'search'} and self.economy:
+            if not await self.economy_allowed(context.get('user_id')):
+                raise UserError(NOTICE)
         if operation == 'llm_attempt':
             if not await self.repo.reserve_llm_call(**context):
                 raise UserError('Дневной лимит анализа исчерпан. Попробуйте завтра.')
@@ -90,7 +95,12 @@ class BotService:
         inherited = bool(user and (user.is_admin or user_id in self.settings.admin_ids))
         return await self.commerce.role(user_id, inherited) if self.commerce else inherited
 
+    async def economy_allowed(self, user_id):
+        return not self.economy or await self.economy.allowed(user_id, self.settings.admin_ids)
+
     async def _require_user(self, user_id):
+        if not await self.economy_allowed(user_id):
+            raise UserError(NOTICE)
         if not await self.repo.get_user(user_id):
             raise UserError('Доступ только по приглашению. Откройте вашу пригласительную ссылку.')
 
@@ -410,11 +420,15 @@ class BotService:
         failed = False
         charge = None
         try:
+            if not await self.economy_allowed(story.user_id):
+                raise UserError(NOTICE)
             if self.commerce:
                 charge = await self.commerce.reserve(story.user_id, 'check', story.lock_token)
             await report('queued')
             async with self._checks:
                 async with asyncio.timeout(600):
+                    if not await self.economy_allowed(story.user_id):
+                        raise UserError(NOTICE)
                     options = await self.report_options()
                     candidates = await self._candidates(story, metrics=metrics, options=options)
                     analysis = None
@@ -436,6 +450,8 @@ class BotService:
                             and analysis.novelty_score >= .65 and analysis.importance_score >= .55
                             and analysis.confidence >= .75 and analysis.new_facts and analysis.source_urls
                             and analysis.notification_summary and analysis.updated_state)
+                    if not await self.economy_allowed(story.user_id):
+                        raise UserError(NOTICE)
                     await report('saving_result', sources=len(candidates))
                     uncertain = bool(candidates and (not any(c.full_text for c in candidates)
                         or (analysis and analysis.relevant and analysis.confidence < .75)))

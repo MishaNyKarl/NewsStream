@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from sqlalchemy import delete, func, or_, select
 
+from app.economy import permitted
 from app.domain import InterestSaveResult, StoryExtraction, UserError
 from app.models import Story, User, UserInterest, UserNews, utcnow
 from app.product_analytics import add_event
@@ -170,7 +171,7 @@ class NewsRepository:
     async def pending_news_notices(self):
         async with self._transaction() as db:
             now = utcnow()
-            items = list((await db.scalars(select(UserNews).where(UserNews.status == 'ready',
+            items = list((await db.scalars(select(UserNews).where(permitted(UserNews.user_id, self.settings.admin_ids), UserNews.status == 'ready',
                 UserNews.notice_suppressed.is_(False), UserNews.notice_sent_at.is_(None), UserNews.notice_attempts < 5,
                 or_(UserNews.notice_locked_until.is_(None), UserNews.notice_locked_until <= now))
                 .order_by(UserNews.id).limit(1).with_for_update(skip_locked=True, key_share=True))).all())
