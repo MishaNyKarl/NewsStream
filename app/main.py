@@ -45,14 +45,15 @@ async def main(role='bot'):
                     BotCommand(command='journal', description='Журнал уведомлений'),
                     BotCommand(command='report', description='Время ежедневного отчёта'),
                     BotCommand(command='interests', description='Мои интересы'),
-                    BotCommand(command='account', description='💎 Подписка и кредиты'),
+                    BotCommand(command='account', description='💎 Мой тариф и баланс'),
+                    BotCommand(command='settings', description='⚙️ Настройки аккаунта'),
                     BotCommand(command='check_now', description='Проверить сюжет'),
                     BotCommand(command='help', description='Помощь'),
-                    BotCommand(command='admin', description='Управление тестом'),
+                    BotCommand(command='admin', description='Админ-меню'),
                 ], request_timeout=15)
                 await bot.set_my_name(name='Развитие новостей', request_timeout=15)
-                await bot.set_my_description(description='Пришлите новость, ссылку или тему — бот будет следить за развитием этой истории и сообщать о существенных изменениях. Закрытый тест: вход по приглашению.', request_timeout=15)
-                await bot.set_my_short_description(short_description='Наблюдение за развитием конкретных историй. Существенные обновления и ссылки на источники.', request_timeout=15)
+                await bot.set_my_description(description='Ваши новости — в одном ежедневном отчёте. Пришлите ссылку, пост или тему и выберите время по Москве. Для срочных историй включите «Следить внимательнее». Вход по приглашению.', request_timeout=15)
+                await bot.set_my_short_description(short_description='Ежедневный отчёт по вашим новостям. Срочные обновления, полные отчёты и источники.', request_timeout=15)
             except TelegramAPIError as exc:
                 logging.getLogger(__name__).warning('Profile setup skipped: %s', type(exc).__name__)
             dp = Dispatcher()

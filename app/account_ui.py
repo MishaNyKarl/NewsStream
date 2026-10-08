@@ -8,10 +8,12 @@ from app.navigation import with_home
 
 def account_keyboard(view='home'):
     buttons = [('💎 Мой тариф', 'home'), ('🪙 Стоимость действий', 'prices'),
-               ('🧾 История кредитов', 'history'), ('➕ Пополнение и смена тарифа', 'manage')]
+               ('🧾 История кредитов', 'history'), ('🛍 Тарифы и предложения', 'manage')]
     rows = [[InlineKeyboardButton(text=label, callback_data=f'account:{key}')]
             for label, key in buttons if key != view]
     rows.append([InlineKeyboardButton(text='📋 Мои наблюдения', callback_data='list:0')])
+    rows.append([InlineKeyboardButton(text='🛍 Открыть каталог тарифов', callback_data='shop:home')])
+    rows.append([InlineKeyboardButton(text='⚙️ Настройки аккаунта', callback_data='settings:home')])
     return with_home(rows)
 
 
@@ -30,11 +32,9 @@ def account_screen(value, view='home', entries=()):
         return heading + '\n\n<b>Последние 10 изменений · МСК</b>\n\n' + (
             '\n\n'.join(lines) or 'Пока нет изменений баланса.')
     if view == 'manage':
-        return heading + ('\n\n<b>Пополнить баланс или сменить тариф</b>\n'
-            'Во время тестирования это делает организатор теста. Напишите ему, '
-            'какой тариф или сколько кредитов вам нужно.\n\n'
-            'После изменения откройте «Мой тариф» — баланс и возможности обновятся. '
-            'Онлайн-оплата и автоматическое продление пока недоступны.')
+        return heading + ('\n\n<b>Тарифы и предложения</b>\n'
+            'Откройте каталог тарифов по кнопке ниже. Онлайн-оплата пока в разработке; '
+            'выбор тарифа не списывает деньги и не подключает подписку.')
     if view == 'prices':
         def price(key):
             return f"{p[key]} кр." if p[key] else 'Бесплатно'

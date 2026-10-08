@@ -337,7 +337,8 @@ async def test_home_always_sends_a_new_root_message_so_progress_cannot_overwrite
     await harness.callback('menu:0')
     assert not any(isinstance(c, EditMessageText) for c in harness.session.calls)
     root = next(c for c in harness.session.calls if isinstance(c, SendMessage))
-    assert [b.callback_data for b in root.reply_markup.inline_keyboard[0]] == ['news:0', 'jp:week']
+    assert [b.callback_data for b in root.reply_markup.inline_keyboard[0]] == ['add:news']
+    assert [b.callback_data for b in root.reply_markup.inline_keyboard[1]] == ['news:0', 'jp:week']
     harness.service.process_user_news.assert_not_awaited()
 
 

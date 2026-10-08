@@ -21,7 +21,8 @@ QUEUE_LOCK = 419281703
 
 def report_keyboard():
     return with_home([[InlineKeyboardButton(text=value + ' МСК', callback_data='report:' + value)
-                       for value in ('09:00', '18:00', '21:00')]])
+                       for value in ('09:00', '18:00', '21:00')],
+                      [InlineKeyboardButton(text='⚙️ Настройки аккаунта', callback_data='settings:home')]])
 
 
 def parse_time(value):

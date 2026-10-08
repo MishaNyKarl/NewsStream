@@ -9,6 +9,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 from urllib.parse import urlsplit
 
 from aiogram import BaseMiddleware, F, Router
@@ -341,7 +342,8 @@ class AccessMiddleware(BaseMiddleware):
                 is_date_reply = (isinstance(event, Message) and event.reply_to_message
                     and (event.reply_to_message.text or '').startswith(DATE_PROMPT))
                 if (isinstance(event, Message) and (event.text or event.caption)
-                        and not is_date_reply and (event.forward_origin or not (event.text or '').startswith('/'))):
+                        and not is_date_reply and (event.forward_origin or not (event.text or '').startswith('/'))
+                        and (event.text or '').strip().casefold() not in {'admin', 'админ'}):
                     seed = extract_story_input(event, data.get('album_messages'))
                     item = await self.service.save_user_news(user.id, seed.text, source_url=seed.source_url,
                         use_text=seed.use_text, input_message_id=event.message_id)
@@ -397,6 +399,83 @@ def _command_id(command: CommandObject) -> int | None:
 def build_router(service: Any, settings: Any) -> Router:
     progress_budget = ProgressEditBudget()
     router = Router(name="news_watch")
+    confirmations = {}
+
+    def confirmation(uid, action, value=None):
+        now = time.monotonic()
+        for owner, pending in list(confirmations.items()):
+            if pending[3] < now:
+                confirmations.pop(owner, None)
+        token = uuid4().hex[:16]
+        confirmations[uid] = (token, action, value, now + 300)
+        return token
+
+    def consume_confirmation(uid, token, action):
+        pending = confirmations.get(uid)
+        if not pending or pending[0] != token or pending[1] != action or pending[3] < time.monotonic():
+            raise UserError('Подтверждение устарело. Откройте раздел заново.')
+        confirmations.pop(uid, None)
+        return pending[2]
+
+    async def show_settings(message, uid, replace=True):
+        pref = await service.repo.report_preference(uid)
+        value = await service.commerce.snapshot(uid)
+        enabled = not value['account'] or value['account'].promotions_enabled
+        current = f'{pref.minute // 60:02d}:{pref.minute % 60:02d} МСК' if pref and pref.minute is not None else 'не выбрано'
+        rows = [[InlineKeyboardButton(text='🕒 Время ежедневного отчёта', callback_data='report:settings')],
+            [InlineKeyboardButton(text='🔕 Отключить предложения' if enabled else '🔔 Включить предложения',
+                                  callback_data=f'settings:ads:{0 if enabled else 1}')],
+            [InlineKeyboardButton(text='💎 Тариф и баланс', callback_data='account:home')],
+            [InlineKeyboardButton(text='🗑 Начать заново', callback_data='settings:reset')]]
+        await (_replace if replace else _answer)(message,
+            f'⚙️ <b>Настройки аккаунта</b>\n\nОтчёт: {current}\n'
+            f'Предложения и скидки: {"включены" if enabled else "выключены"}\n\n'
+            'Здесь можно изменить расписание, управлять предложениями и очистить свои новости и темы.', _keyboard(*rows))
+
+    async def show_catalog(message, uid, admin=False):
+        if admin and not await service.is_admin(uid):
+            raise UserError('Это действие доступно только администратору.')
+        plans = await service.commerce.catalog()
+        rows = [[InlineKeyboardButton(text=f'{p.name[:35]} · {p.price_minor / 100:.2f} {p.currency}',
+                 callback_data=f'{"admplan" if admin else "shop"}:{p.id}')] for p in plans]
+        if admin:
+            rows.append([InlineKeyboardButton(text='🗑 Снять мой тариф', callback_data='admplan:0')])
+            rows.append([InlineKeyboardButton(text='← Админ-меню', callback_data='admin:home')])
+        else:
+            rows.append([InlineKeyboardButton(text='💎 Мой тариф', callback_data='account:home')])
+        await _replace(message, ('🛠 <b>Мои тестовые подписки</b>\n\n'
+            'Выберите тариф для своего аккаунта. Подключение тестовое, без списания денег. '
+            'Снятие тарифа возвращает базовые возможности. Индивидуальные лимиты сохраняются.' if admin else
+            '🛍 <b>Тарифы</b>\n\nВыберите тариф, чтобы посмотреть возможности и условия. '
+            'Онлайн-оплата пока в разработке.') + ('\n\nТарифов пока нет. Администратор может добавить их в админке.' if not plans else ''),
+            _keyboard(*rows))
+
+    def admin_keyboard():
+        rows = [[InlineKeyboardButton(text='📊 Статистика', callback_data='admin:stats'),
+                          InlineKeyboardButton(text='🛠 Ошибки', callback_data='admin:errors')],
+                         [InlineKeyboardButton(text='💎 Мои тестовые подписки', callback_data='admin:plans')],
+                         [InlineKeyboardButton(text='🧪 Тест уведомления', callback_data='admin:demo')],
+                         [InlineKeyboardButton(text='📣 Рассылки и управление', callback_data='admin:web')]]
+        url = getattr(settings, 'admin_panel_url', '')
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password and not any(c.isspace() for c in url):
+                rows.append([InlineKeyboardButton(text='🌐 Открыть админку', url=url)])
+        except ValueError:
+            pass
+        return _keyboard(*rows)
+
+    async def show_admin(message, uid, replace=True):
+        if not await service.is_admin(uid):
+            raise UserError('Эта команда доступна только администратору.')
+        text = ('🛠 <b>Админ-меню</b>\n\nСтатистика, ошибки, тест уведомлений и управление своим тарифом. '
+                'Рассылки, цены и роли пользователей настраиваются в защищённой веб-админке.')
+        if settings.invite_code and re.fullmatch(r'[A-Za-z0-9_-]{1,57}', settings.invite_code):
+            me = await message.bot.get_me()
+            if me.username and re.fullmatch(r'[A-Za-z0-9_]+', me.username):
+                url = f'https://t.me/{me.username}?start=invite_{settings.invite_code}'
+                text += f'\n\n<a href="{html.escape(url, quote=True)}">Приглашение для пользователя</a>'
+        await (_replace if replace else _answer)(message, text, admin_keyboard())
     access = AccessMiddleware(service)
     router.message.outer_middleware(AlbumMiddleware())
     router.message.outer_middleware(access)
@@ -417,7 +496,9 @@ def build_router(service: Any, settings: Any) -> Router:
             '🏠 <b>Главное меню</b>\n\nПришлите новость, ссылку или пост из канала. '
             'Сначала сохраню её, затем обработаю и отдельно сообщу, когда можно выбрать действие.\n\n'
             '📥 <b>Новости пользователя</b> — всё, что вы прислали, включая отложенное и ошибки обработки.\n'
-            '🗂 <b>Журнал</b> — отправленные уведомления о развитии новостей.',
+            '🗂 <b>Журнал</b> — отправленные уведомления о развитии новостей.\n\n'
+            '🗓 Один ежедневный отчёт по вашим историям. Для срочных тем — «Следить внимательнее». '
+            'Расписание и управление данными — в настройках аккаунта.',
             main_keyboard())
 
     async def show_news(message, user_id, before_id=0, replace=False):
@@ -635,15 +716,12 @@ def build_router(service: Any, settings: Any) -> Router:
     async def start(message: Message) -> None:
         ready = "" if service.provider_ready() else "\n\n⚙️ Анализ временно недоступен: администратору нужно настроить API-ключ LLM."
         await _answer(message,
-            "📰 <b>Следите за развитием истории</b>\n\n"
-            "Пришлите ссылку, перешлите пост из канала или напишите, за чем следить. Посты с фото/видео принимаю по тексту подписи. Я покажу, что понял, и попрошу подтвердить наблюдение.\n\n"
-            "Обычные подписки собираю в ежедневный отчёт в выбранное время по Москве. "
-            "Без изменений — прочерк. В срочном режиме важные изменения присылаю после каждой проверки.\n\n"
-            + INTENSIVE_HELP + "\n\n"
-            "Например: «Когда откроют новую станцию метро и изменились ли сроки?»\n\n"
-            "Можно выбрать «⭐ Просто интересна тема» — запомню интерес для будущих подборок без запуска наблюдения.\n\n"
-            "Все присланные новости сохраню в «Новости пользователя». Когда карточка будет готова, пришлю отдельное сообщение.\n\n"
-            "Тариф и баланс — /account · Новости — /news · Ваши сюжеты — /watching · Журнал — /journal · Мои интересы — /interests · Помощь — /help" + ready,
+            "📰 <b>Ваши новости — в одном ежедневном отчёте</b>\n\n"
+            "Пришлите ссылку, перешлите пост или напишите тему. Сохраню новость, обработаю её и предложу выбрать действие.\n\n"
+            "🗓 <b>Ежедневный отчёт</b> — коротко о развитии ваших историй в выбранное время по Москве. Без изменений — прочерк.\n"
+            "⚡ <b>Следить внимательнее</b> — важные изменения после срочных проверок.\n"
+            "⭐ <b>Просто интересна тема</b> — сохранить интерес без наблюдения.\n\n"
+            "Расписание и управление данными — в настройках аккаунта. Тарифы — в каталоге. Подробности — в помощи." + ready,
             main_keyboard())
 
     @router.message(Command("help"), ~F.forward_origin)
@@ -696,7 +774,13 @@ def build_router(service: Any, settings: Any) -> Router:
 
     @router.message(Command("admin"), ~F.forward_origin)
     async def admin(message: Message) -> None:
-        user_id = message.from_user.id
+        await show_admin(message, message.from_user.id, replace=False)
+
+    @router.message(F.text.lower().in_({'admin', 'админ'}), ~F.forward_origin)
+    async def admin_word(message: Message):
+        await show_admin(message, message.from_user.id, replace=False)
+
+    async def show_admin_stats(message, user_id):
         if not await service.is_admin(user_id):
             raise UserError("Эта команда доступна только администратору.")
         summary = await service.admin_summary(user_id)
@@ -708,7 +792,7 @@ def build_router(service: Any, settings: Any) -> Router:
                 url = f"https://t.me/{me.username}?start=invite_{settings.invite_code}"
                 text += f'\n\n<a href="{html.escape(url, quote=True)}">Приглашение для тестировщика</a>\nПередавайте только участникам закрытого теста.'
         text += "\n\n/admin_errors — последние ошибки\n/demo_update — тестовое уведомление (если включён demo mode)"
-        await _answer(message, text)
+        await _replace(message, text, admin_keyboard())
 
     @router.message(Command("admin_errors"), ~F.forward_origin)
     async def admin_errors(message: Message) -> None:
@@ -746,6 +830,103 @@ def build_router(service: Any, settings: Any) -> Router:
 
     @router.callback_query()
     async def callback(query: CallbackQuery) -> None:
+        data = query.data or ''
+        uid = query.from_user.id
+        if data == 'add:news':
+            await query.answer()
+            await _replace(query.message, '➕ <b>Добавить новость</b>\n\nПришлите ссылку, текст или '
+                'перешлите пост из канала. Можно написать тему своими словами. '
+                'Сохраню новость и сообщу, когда можно выбрать наблюдение.', main_keyboard())
+            return
+        if data.startswith('admin:'):
+            if not await service.is_admin(uid):
+                raise UserError('Это действие доступно только администратору.')
+            await query.answer()
+            action = data.split(':', 1)[1]
+            if action == 'home':
+                await show_admin(query.message, uid)
+            elif action == 'stats':
+                await show_admin_stats(query.message, uid)
+            elif action == 'errors':
+                await _replace(query.message, escaped(await service.admin_errors(uid), 3300), admin_keyboard())
+            elif action == 'plans':
+                confirmations.pop(uid, None)
+                await show_catalog(query.message, uid, admin=True)
+            elif action == 'demo':
+                await _replace(query.message, escaped(await service.demo_update(uid), 1800), admin_keyboard())
+            elif action == 'web':
+                await _replace(query.message, '📣 <b>Веб-админка</b>\n\n'
+                    '«Оповещения»: новости бота, рекламные предложения и скидки, предпросмотр и тестовая отправка.\n'
+                    '«Тарифы и кредиты»: цены, лимиты, назначение тарифа, баланс и роли.\n'
+                    'Доступ — по отдельному логину и паролю администратора.', admin_keyboard())
+            return
+        if data.startswith('settings:'):
+            await query.answer()
+            if data == 'settings:home':
+                confirmations.pop(uid, None)
+                await show_settings(query.message, uid)
+            elif data in {'settings:ads:0', 'settings:ads:1'}:
+                await service.commerce.set_promotions(uid, data.endswith(':1'))
+                await show_settings(query.message, uid)
+            elif data == 'settings:reset':
+                token = confirmation(uid, 'reset')
+                await _replace(query.message, '🗑 <b>Начать заново?</b>\n\n'
+                    'Будут удалены все ваши новости, наблюдения, интересы, история обновлений и время отчёта. '
+                    'Восстановить их нельзя. Тариф, баланс и доступ сохранятся.\n\n'
+                    'Уже отправленные сообщения останутся в чате.', _keyboard(
+                    [InlineKeyboardButton(text='Да, удалить мои новости и темы', callback_data=f'settings:confirm:{token}')],
+                    [InlineKeyboardButton(text='Отмена', callback_data='settings:home')]))
+            elif data.startswith('settings:confirm:'):
+                consume_confirmation(uid, data.rsplit(':', 1)[1], 'reset')
+                await service.repo.reset_content(uid)
+                await _replace(query.message, '✅ Ваши новости и темы очищены. Пришлите новую новость, '
+                    'чтобы начать заново. Тариф и баланс сохранены.', main_keyboard())
+            return
+        if data.startswith('admplan:') or data.startswith('admconfirm:'):
+            if not await service.is_admin(uid):
+                raise UserError('Это действие доступно только администратору.')
+            await query.answer()
+            if data.startswith('admconfirm:'):
+                token = data.split(':', 1)[1]
+                plan_id = consume_confirmation(uid, token, 'plan')
+                await service.commerce.admin_self_plan(uid, plan_id, f'self-plan:{uid}:{token}')
+                await _replace(query.message, '✅ Тестовый тариф обновлён.\n\n' + await service.account_text(uid), admin_keyboard())
+            else:
+                raw = data.split(':', 1)[1]
+                if not raw.isascii() or not raw.isdigit() or len(raw) > 10:
+                    raise UserError('Кнопка устарела.')
+                plan_id = int(raw)
+                chosen = next((p for p in await service.commerce.catalog() if p.id == plan_id), None)
+                if plan_id and chosen is None:
+                    raise UserError('Тариф недоступен.')
+                token = confirmation(uid, 'plan', plan_id)
+                await _replace(query.message, f'Подключить себе тестовый тариф «{escaped(chosen.name, 160)}» без оплаты?' if chosen else
+                    'Снять свой тариф и вернуться к базовым возможностям?', _keyboard(
+                    [InlineKeyboardButton(text='Подтвердить', callback_data=f'admconfirm:{token}')],
+                    [InlineKeyboardButton(text='Отмена', callback_data='admin:plans')]))
+            return
+        if data.startswith('shop:'):
+            await query.answer()
+            raw = data.split(':', 1)[1]
+            if raw == 'home':
+                await show_catalog(query.message, uid)
+            elif raw.isascii() and raw.isdigit() and len(raw) <= 10:
+                plan = next((p for p in await service.commerce.catalog() if p.id == int(raw)), None)
+                if not plan:
+                    raise UserError('Тариф больше недоступен.')
+                await _replace(query.message, f'💎 <b>{escaped(plan.name, 160)}</b>\n\n'
+                    f'Цена: {plan.price_minor / 100:.2f} {escaped(plan.currency, 10)} / {plan.period_days} дней\n'
+                    f'Тем одновременно: {plan.stories}\nСрочных тем: {plan.intensive_slots}\n'
+                    f'Ручных проверок в сутки: {plan.manual_daily}\n'
+                    f'Обсуждение: {"включено" if plan.discussion else "не включено"}\n\n'
+                    f'Кредиты за действие: разбор {plan.news_credits}, проверка {plan.check_credits}, '
+                    f'обсуждение {plan.discussion_credits}.\n\nОнлайн-оплата пока в разработке.', _keyboard(
+                    [InlineKeyboardButton(text='🛒 Купить — скоро', callback_data='purchase:stub')],
+                    [InlineKeyboardButton(text='← Все тарифы', callback_data='shop:home')]))
+            return
+        if data == 'purchase:stub':
+            await query.answer('Онлайн-оплата пока в разработке. Деньги не списаны.', show_alert=True)
+            return
         if (query.data or '').startswith('report:'):
             await query.answer()
             value = query.data.split(':', 1)[1]
@@ -975,6 +1156,10 @@ def build_router(service: Any, settings: Any) -> Router:
     @router.message(Command('account'), ~F.forward_origin)
     async def account_command(message: Message):
         await _answer(message, await service.account_text(message.from_user.id), account_keyboard())
+
+    @router.message(Command('settings'), ~F.forward_origin)
+    async def settings_command(message: Message):
+        await show_settings(message, message.from_user.id, replace=False)
 
     @router.message(Command('discuss'), ~F.forward_origin)
     async def discuss_command(message: Message):

@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     allowed_telegram_ids: str = ''
     invite_code: str = ''
     admin_claim_token: str = ''
+    admin_panel_url: str = ''
     max_testers: int = 10
     llm_provider: str = 'disabled'
     llm_api_key: str = ''

@@ -150,6 +150,13 @@ async def deliver_announcements(service, bot, limit=10):
             keyboard = with_home([[InlineKeyboardButton(text='🕒 Выбрать время отчёта', callback_data='report:settings')]])
         elif campaign.button == 'menu':
             keyboard = with_home()
+        elif campaign.button == 'buy':
+            account = await service.commerce.snapshot(delivery.user_id)
+            if account['account'] and not account['account'].promotions_enabled:
+                await queue.finish(delivery.id, delivery.token, 'cancelled')
+                continue
+            keyboard = with_home([[InlineKeyboardButton(text='🛍 Посмотреть тарифы / купить', callback_data='shop:home')],
+                [InlineKeyboardButton(text='⚙️ Настройки предложений', callback_data='settings:home')]])
         try:
             message = await bot.send_message(delivery.user_id, announcement_text(campaign), parse_mode=None,
                 reply_markup=keyboard, disable_web_page_preview=True, request_timeout=30)

@@ -257,6 +257,23 @@ class Repository(NewsRepository, ProductAnalyticsRepository, DailyReportReposito
         story.lock_until = story.lock_token = story.next_check_at = None
         story.updated_at = utcnow()
 
+    async def reset_content(self, user_id):
+        """Invalidate work leases and erase owned content; retain billing and access."""
+        from app.models import DailyReport
+        async with self._transaction() as session:
+            await self._advisory(session, 419281703)
+            user = await session.scalar(select(User).where(User.telegram_id == user_id).with_for_update(key_share=True))
+            if user is None:
+                raise UserError('Пользователь не найден.')
+            stories = list(await session.scalars(select(Story).where(Story.user_id == user_id)
+                .order_by(Story.id).with_for_update(key_share=True)))
+            for story in stories:
+                await self._redact(session, story)
+            await session.execute(delete(UserInterest).where(UserInterest.user_id == user_id))
+            await session.execute(delete(UserNews).where(UserNews.user_id == user_id))
+            await session.execute(delete(DailyReport).where(DailyReport.user_id == user_id))
+            self._event(session, 'account_content_reset', user_id=user_id)
+
     async def create_draft(self, user_id, original_input, original_url, extraction: StoryExtraction):
         async with self._transaction() as session:
             user = await session.scalar(select(User).where(User.telegram_id == user_id).with_for_update(key_share=True))

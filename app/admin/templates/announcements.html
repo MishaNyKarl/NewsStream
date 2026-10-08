@@ -1,6 +1,7 @@
 {% extends 'base.html' %}{% block content %}
 {% macro hidden(action, cid=None) %}<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="action" value="{{ action }}">{% if cid %}<input type="hidden" name="campaign" value="{{ cid }}">{% endif %}{% endmacro %}
-<p>Сообщайте пользователям об изменениях бота, новом расписании и технических работах. Рассылка отправляется через бота по очереди. Откройте страницу заново, чтобы обновить результаты.</p>
+<p>Сообщайте об изменениях бота, отправляйте предложения тарифов и скидки. Рассылка отправляется через бота по очереди. Откройте страницу заново, чтобы обновить результаты.</p>
+<section class="panel"><h2>Предложения и скидки</h2><p>Выберите рекламный шаблон, укажите цену, скидку, срок и условия. Кнопка «Посмотреть тарифы / купить» открывает каталог в боте. Онлайн-оплата пока — заглушка: пользователь не платит и тариф автоматически не подключается.</p><p><a href="/announcements?template=offer#compose">Предложение тарифа</a> · <a href="/announcements?template=discount#compose">Скидка</a> · <a href="/commerce">Настроить тарифы и цены</a></p><p class="muted">При выборе рекламной кнопки пользователи, отключившие предложения в настройках аккаунта, исключаются из получателей. Перед отправкой предпочтение проверяется снова. Служебные оповещения остаются доступными.</p></section>
 <section class="metrics">
 <article><span>Пользователей</span><strong>{{ result.coverage.all }}</strong></article>
 <article><span>С обычными подписками</span><strong>{{ result.coverage.daily }}</strong><small>Включая темы на паузе</small></article>
@@ -29,7 +30,7 @@
 {% endif %}
 {% if web_role in ['owner','admin'] %}
 <section class="panel" id="compose"><h2>Подготовить оповещение</h2>
-<p><a href="/announcements?template=update#compose">Обновление бота</a> · <a href="/announcements?template=reminder#compose">Напомнить о времени отчёта</a> · <a href="/announcements?template=maintenance#compose">Технические работы</a></p>
+<p><a href="/announcements?template=update#compose">Обновление бота</a> · <a href="/announcements?template=reminder#compose">Напомнить о времени отчёта</a> · <a href="/announcements?template=maintenance#compose">Технические работы</a> · <a href="/announcements?template=offer#compose">Предложение тарифа</a> · <a href="/announcements?template=discount#compose">Скидка</a></p>
 <form method="post">{{ hidden('create') }}<input type="hidden" name="key" value="{{ key() }}">
 <label>Название<input name="title" maxlength="160" value="{{ preset.title }}" required></label>
 <label>Сообщение<textarea name="body" rows="12" maxlength="2500" required>{{ preset.body }}</textarea></label>

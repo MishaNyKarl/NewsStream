@@ -7,12 +7,13 @@ from sqlalchemy import func, or_, select, text
 
 from app.commerce import Commerce
 from app.errors import UserError
-from app.models import Announcement, AnnouncementDelivery, DailyReport, Story, User, utcnow
+from app.models import Account, Announcement, AnnouncementDelivery, DailyReport, Story, User, utcnow
 
 AUDIENCES = {'all': 'Все пользователи', 'daily': 'С обычными подписками',
              'no_time': 'С обычными подписками, ещё без времени отчёта',
              'active': 'С активными наблюдениями', 'selected': 'Выбранные пользователи'}
-BUTTONS = {'report': '🕒 Выбрать время отчёта', 'menu': '🏠 Открыть бот', 'none': 'Без кнопки'}
+BUTTONS = {'report': '🕒 Выбрать время отчёта', 'menu': '🏠 Открыть бот',
+           'buy': '🛍 Посмотреть тарифы / купить', 'none': 'Без кнопки'}
 STATUSES = {'draft': 'Черновик', 'queued': 'В очереди', 'completed': 'Завершено', 'cancelled': 'Остановлено',
             'pending': 'Ожидает', 'sending': 'Отправляется', 'sent': 'Доставлено', 'blocked': 'Бот недоступен',
             'failed': 'Ошибка'}
@@ -27,6 +28,12 @@ UPDATE_TEMPLATE = dict(title='Новости теперь в ежедневно�
     '📖 «Читать дальше» под новым уведомлением открывает полный отчёт. '
     'В старых сообщениях подробности доступны через историю новости.'))
 TEMPLATES = {'update': UPDATE_TEMPLATE,
+    'offer': dict(title='Больше возможностей для ваших новостей', audience='all', button='buy',
+        body='Укажите название тарифа, возможности, цену и условия предложения. '
+             'По кнопке ниже можно посмотреть тарифы. Онлайн-оплата пока в разработке.'),
+    'discount': dict(title='Специальное предложение', audience='all', button='buy',
+        body='Укажите размер скидки, обычную и специальную цену, срок по Москве и условия. '
+             'По кнопке ниже можно посмотреть тарифы. Онлайн-оплата пока в разработке.'),
     'reminder': dict(title='Выберите время ежедневного отчёта', audience='no_time', button='report',
         body='Ваши обычные подписки сохранены. Чтобы получать ежедневный отчёт, выберите удобное время по Москве. '
              'Нажмите кнопку ниже или отправьте /report ЧЧ:ММ. Темы на паузе не включаются до возобновления.'),
@@ -91,6 +98,9 @@ class Announcements:
             if existing:
                 return existing
             owners = await self.recipients(session, audience, values.get('ids', ''))
+            if button == 'buy':
+                disabled = set(await session.scalars(select(Account.user_id).where(Account.promotions_enabled.is_(False))))
+                owners = [uid for uid in owners if uid not in disabled]
             if not owners:
                 raise UserError('В выбранной аудитории нет пользователей.')
             campaign = Announcement(key=key, title=title, body=body, audience=audience, button=button,

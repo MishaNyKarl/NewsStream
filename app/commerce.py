@@ -76,6 +76,40 @@ class Commerce:
                 CreditEntry.user_id == uid, CreditEntry.delta != 0).order_by(
                 CreditEntry.created_at.desc(), CreditEntry.id.desc()).limit(10)))
 
+    async def catalog(self):
+        async with self.sessions() as session:
+            return list(await session.scalars(select(Plan).order_by(Plan.price_minor, Plan.id).limit(50)))
+
+    async def set_promotions(self, uid, enabled):
+        async with self.transaction() as session:
+            account = await self.account(session, uid)
+            account.promotions_enabled = bool(enabled)
+            account.version += 1
+
+    async def admin_self_plan(self, uid, plan_id, key):
+        """Sandbox entitlement assignment, never a paid order or balance adjustment."""
+        async with self.transaction() as session:
+            if session.bind.dialect.name == 'postgresql':
+                from sqlalchemy import text
+                await session.execute(text('SELECT pg_advisory_xact_lock(419281703)'))
+            account = await self.account(session, uid)
+            user = await session.get(User, uid)
+            inherited = user.is_admin or uid in self.settings.admin_ids
+            if not (inherited if account.role == 'inherit' else account.role == 'admin'):
+                raise UserError('Это действие доступно только администратору.')
+            if await session.scalar(select(CommerceAudit.id).where(CommerceAudit.key == key)):
+                return
+            plan = await session.get(Plan, plan_id) if plan_id else None
+            if plan_id and plan is None:
+                raise UserError('Тариф больше недоступен. Откройте каталог заново.')
+            before = account.plan_id
+            account.plan_id = plan.id if plan else None
+            account.expires_at = utcnow() + timedelta(days=plan.period_days) if plan else None
+            account.version += 1
+            session.add(CommerceAudit(key=key, actor=f'telegram:{uid}', user_id=uid,
+                action='admin_self_plan', detail={'before': before, 'plan_id': account.plan_id,
+                    'reason': 'Тестовое подключение администратором; без оплаты'}))
+
     async def role(self, uid, inherited):
         async with self.sessions() as session:
             account = await session.get(Account, uid)

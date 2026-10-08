@@ -14,12 +14,14 @@ def with_home(rows=()):
 
 def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='📥 Новости пользователя', callback_data='news:0'),
+        [InlineKeyboardButton(text='➕ Добавить новость', callback_data='add:news')],
+        [InlineKeyboardButton(text='📥 Мои новости', callback_data='news:0'),
          InlineKeyboardButton(text='🗂 Журнал', callback_data='jp:week')],
         [InlineKeyboardButton(text='📋 Мои наблюдения', callback_data='list:0'),
          InlineKeyboardButton(text='⭐ Мои интересы', callback_data='interests:0')],
-        [InlineKeyboardButton(text='💎 Подписка и кредиты', callback_data='account:home')],
-        [InlineKeyboardButton(text='🕒 Время ежедневного отчёта', callback_data='report:settings')],
+        [InlineKeyboardButton(text='💎 Мой тариф', callback_data='account:home'),
+         InlineKeyboardButton(text='🛍 Каталог', callback_data='shop:home')],
+        [InlineKeyboardButton(text='⚙️ Настройки аккаунта', callback_data='settings:home')],
         [InlineKeyboardButton(text='❔ Как пользоваться', callback_data='help:0')]])
 
 

@@ -144,6 +144,7 @@ async def test_schema_migration_matches_and_preserves_users(store):
         with Operations.context(context):
             migration.downgrade()
             migration.upgrade()
+            importlib.import_module('migrations.versions.0012_account_settings').upgrade()
         assert compare_metadata(context, Base.metadata) == []
     async with factory.kw['bind'].begin() as conn:
         await conn.run_sync(upgrade)

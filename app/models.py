@@ -1,7 +1,7 @@
 """Persistence models. Dates are UTC-aware on PostgreSQL and in SQLite tests."""
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, LargeBinary, String, Text, UniqueConstraint, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, LargeBinary, String, Text, UniqueConstraint, text, true
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -269,6 +269,7 @@ class Account(Base):
     intensive_override: Mapped[int | None] = mapped_column(Integer)
     discussion_override: Mapped[bool | None] = mapped_column(Boolean)
     version: Mapped[int] = mapped_column(Integer, default=0)
+    promotions_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true(), nullable=False)
 
 
 class CreditEntry(Base):
